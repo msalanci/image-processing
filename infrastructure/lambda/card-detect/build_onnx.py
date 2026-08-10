@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2025 Michal Salanci
+# Copyright (c) 2026 Michal Salanci
 
 """
 BUILD-TIME export (uses PyTorch) — run this ONCE to produce the artifacts the torch-free runtime (detect_card.py) needs:

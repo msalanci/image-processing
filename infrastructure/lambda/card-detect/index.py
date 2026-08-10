@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2025 Michal Salanci
+# Copyright (c) 2026 Michal Salanci
 
 """Gate that decides whether an uploaded image is an AWS Builder Card.
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2025 Michal Salanci
+# Copyright (c) 2026 Michal Salanci
 
 """Turns a crooked photo of an AWS Builder Card into a clean, straight image.
 

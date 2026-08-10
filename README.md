@@ -198,4 +198,5 @@ so the running stack stays on its previous images.
 
 ## License
 
-MIT — see the SPDX headers. AWS Builder Cards artwork is AWS community material.
+MIT — see [LICENSE](LICENSE), and the SPDX headers on each file. AWS Builder
+Cards artwork is AWS community material.

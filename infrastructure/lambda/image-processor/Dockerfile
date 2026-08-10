@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2025 Michal Salanci
+# Copyright (c) 2026 Michal Salanci
 #
 # CPU container image for the card-cleanup Lambda (rembg/BiRefNet + OpenCV).
 # Build for arm64 (Graviton).

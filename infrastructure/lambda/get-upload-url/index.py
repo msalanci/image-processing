@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2025 Michal Salanci
+# Copyright (c) 2026 Michal Salanci
  
 """Hands the upload form a pre-signed POST, so a photo goes straight to S3.
 

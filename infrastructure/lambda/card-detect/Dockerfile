@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (c) 2025 Michal Salanci
+# Copyright (c) 2026 Michal Salanci
 #
 # CPU container image for the card-detect lambda (ONNX ViT-B/32 P(card)).
 # Build for arm64 (Graviton), same as the image-processor lambda.
