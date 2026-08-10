@@ -3,18 +3,19 @@ SPDX-License-Identifier: MIT
 Copyright (c) 2026 Michal Salanci
 -->
 
-# AWS Builder Cards — Catalog Infrastructure
+# Image processing pipeline, created for AWS Builder Cards Database Infrastructure
 
-A community catalog of collectible **AWS Builder Cards**. Anyone can upload a
-card photo — no sign-in; a cheap ML gate rejects junk; the image is auto-cleaned
-and described by a vision model; a human approves it; it's committed to GitHub
-and published as a static **Hugo** site on **AWS Amplify**.
+A community catalog of collectible [AWS Builder Cards Database](LINK). 
+Anyone can upload a card photo — no sign-in; a cheap ML gate rejects junk and the image is auto-cleaned and described by a vision model. [Michal](https://www.michalsalanci.com) approves it, it's automatically committed to GitHub and published as a static **Hugo** site hosted on **AWS Amplify**.
 
-This repository is the **serverless backend only** — Terraform under
-`infrastructure/` building Lambda + S3 + DynamoDB + SNS + EventBridge, with no
-always-on compute and near-zero cost while idle. The Hugo site lives in a
-**separate repository** (the one the committer publishes into); no site source
-is here.
+This repository is the **serverless backend only**: terraform under
+`infrastructure/` building lambda + S3 + DynamoDB + SNS + EventBridge, with no
+always-on compute and near-zero cost while idle. 
+The Hugo site lives in a **separate repository** (the one the committer publishes into); no site source is here.
+
+This pipeline can be used to **process any images**, not just AWS Builder Cards. See [How can you use it?](#how-can-you-use-it) for more.
+
+---
 
 ## Architecture
 
@@ -80,6 +81,8 @@ The real depth is in the per-Lambda READMEs:
 scores) · [image-processor](infrastructure/lambda/image-processor/README.md)
 (segmentation, memory ceilings, running it locally).
 
+---
+
 ## Repository layout
 
 ```
@@ -89,6 +92,8 @@ infrastructure/            all Terraform (*.tf); Lambda source under lambda/<fn>
   lambda/card-detect/      the gate + build_onnx.py model export (own README)
   lambda/image-processor/  the cleanup pipeline (own README)
 ```
+
+---
 
 ## Prerequisites
 
@@ -107,6 +112,8 @@ Create these **before** the first `terraform apply` (none are managed here):
 On the machine running apply: **Terraform ≥ 1.15**, **Docker with buildx** (both
 container images build for arm64 and push to ECR *during* apply), **AWS
 credentials**, and **Python 3** (for Setup step 2).
+
+---
 
 ## Setup
 
@@ -180,6 +187,8 @@ aws secretsmanager put-secret-value --secret-id buildercards/github-pat \
 credentials, approve a pending card: the committer pushes to your publish
 branch, Amplify rebuilds the site, and the deploy-status email arrives.
 
+---
+
 ## Uploads
 
 - **Formats:** JPG, PNG, HEIC, WebP, BMP, TIFF (HEIC via `pillow-heif` — iPhone
@@ -192,6 +201,43 @@ branch, Amplify rebuilds the site, and the deploy-status email arrives.
 - **Attribution:** the form takes an optional uploader name (60 chars), stored
   as S3 object metadata and carried into the card's DynamoDB record. It is
   self-declared and unverified — treat it as a label, not an identity.
+
+---
+
+## How can you use it?
+
+Nothing in this pipeline is specific to AWS Builder Cards except the **words**.
+It works for any flat collectible — trading cards, postcards, stamps, badges —
+and pointing it at yours is mostly editing English sentences. There is no model
+to train and no dataset to collect.
+
+| To change                       | Edit                                                                                                                                      | Needs a rebuild?                          |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| **What counts as *your* card**  | the three label groups in `lambda/card-detect/build_onnx.py` — describe your cards in `AWS_LABELS`, keep the rest as distractors to score against | yes — re-run `build_onnx.py`, then apply |
+| **How strict the gate is**      | `KEEP_THRESHOLD` / `DROP_THRESHOLD` in `lambda.tf`                                                                                          | no, env vars only                         |
+| **What text is extracted**      | `EXTRACT_SYSTEM` / `EXTRACT_PROMPT` in `lambda/image-processor/app.py`                                                                      | yes, container rebuild                    |
+| **Which fields a card has**     | `write_card_item` in `app.py`, plus the form in `lambda/review-editor/index.py`                                                             | no, zip Lambdas ship on apply             |
+| **Background behind the card**  | `BACKGROUND` env var — `black`, `white` or `none` (transparent)                                                                             | no                                        |
+| **How the published page looks**| your own Hugo templates, in your site repo                                                                                                  | no                                        |
+
+Adding a category is the cheap part: write one more sentence describing it, and
+the gate scores against it from the next build. That is what zero-shot buys you.
+
+**The one real constraint:** corner detection assumes a **rectangular card with
+rounded corners** — it fits a straight line to each edge and intersects them.
+Round, die-cut or irregular shapes need a different `find_quad`.
+
+### The story behind it
+
+Five articles on why it is built this way. The trade-offs, the measurements andthe things that broke:
+
+1. [From anonymous photo to published page: An event-driven AI pipeline on AWS](link) - TBD
+2. [Is this even a valid card? Zero-shot image classification model in a lambda container](link) - TBD
+3. [Where exactly is card in this photo? Image segmentation model inside a maxed-out lambda container](link) - TBD
+4. [What does the card say? Text extraction using Amazon Nova Lite 2](link) - TBD
+5. [Who reviews the reviewer? Building the human step in an AI pipeline](link) - TBD
+
+---
 
 ## Deploy gotchas (container builds)
 
@@ -208,6 +254,8 @@ Docker Desktop, three failures are routine:
 
 A failed build deploys nothing — Terraform aborts before touching the Lambda,
 so the running stack stays on its previous images.
+
+---
 
 ## License
 
