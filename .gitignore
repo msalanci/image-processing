@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Michal Salanci
+
+# hidden and obsolete files and folders
+~$*
+__pycache__
+.DS_Store
+.terraform/
+.terraform.lock.hcl
+.terraform.tfstate.lock.info
+terraform.tfstate
+terraform.tfstate.backup
+.venv/
+
+# lambda artifacts - will be regenerated with the script - see README.md
+infrastructure/lambda/card-detect/onnx_out/
+
+# lambda zips - terraform's archive_file rebuilds these on every plan/apply
+infrastructure/build/

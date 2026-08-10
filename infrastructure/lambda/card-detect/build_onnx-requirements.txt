@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Michal Salanci
+#
+# BUILD-TIME dependencies for build_onnx.py
+# used ONCE on local machine to generate the ONNX model artifacts (onnx_out/). 
+# These are HEAVY (PyTorch) and are NOT shipped in the Lambda image: the card-detect runtime is torch-free
+# (onnxruntime + numpy + pillow + pillow-heif — see requirements.txt). 
+# This file is excluded from the Docker build via .dockerignore.
+#
+#   cd infrastructure/lambda/card-detect
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -U pip && pip install -r build_onnx-requirements.txt
+#   python build_onnx.py        # writes onnx_out/{visual.onnx, visual.onnx.data, text.npz}
+
+torch==2.13.0
+open_clip_torch==3.3.0
+numpy==2.5.1
+onnx==1.22.0
+onnxscript==0.7.1
+onnx_ir==0.2.1

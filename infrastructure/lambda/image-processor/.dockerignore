@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2025 Michal Salanci
+
+**/__pycache__/
+*.pyc
+.venv/
+input/
+output/
+*.md

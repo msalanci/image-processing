@@ -1,0 +1,161 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Michal Salanci
+#
+# The five lambda functions and the permissions that let API Gateway and S3 invoke them.
+
+data "archive_file" "get_upload_url" {
+  type        = "zip"
+  source_file = "${path.module}/lambda/get-upload-url/index.py"
+  output_path = "${path.module}/build/get-upload-url.zip"
+}
+
+resource "aws_lambda_function" "get_upload_url" {
+  function_name = "BuilderCardsGetUploadUrl"
+  runtime       = "python3.14"
+  handler       = "index.handler"
+  role          = aws_iam_role.get_upload_url.arn
+  timeout       = 10
+
+  filename         = data.archive_file.get_upload_url.output_path
+  source_code_hash = data.archive_file.get_upload_url.output_base64sha256
+
+  environment {
+    variables = {
+      BUCKET_NAME      = var.images_bucket_name
+      RAW_PREFIX       = var.raw_prefix
+      MAX_UPLOAD_BYTES = tostring(var.max_upload_bytes)
+    }
+  }
+}
+
+resource "aws_lambda_permission" "get_upload_url_apigw" {
+  statement_id  = "AllowApiGatewayInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.get_upload_url.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.upload.execution_arn}/*/*"
+}
+
+resource "aws_lambda_function" "image_processor" {
+  function_name                  = "BuilderCardsImageProcessor"
+  role                           = aws_iam_role.image_processor.arn
+  package_type                   = "Image"
+  image_uri                      = "${aws_ecr_repository.image_processor.repository_url}@${data.aws_ecr_image.image_processor.image_digest}"
+  architectures                  = ["arm64"]
+  memory_size                    = 10240
+  timeout                        = 180
+  reserved_concurrent_executions = 2
+
+  environment {
+    variables = {
+      RAW_PREFIX           = var.raw_prefix
+      FINISHED_PREFIX      = var.finished_prefix
+      BACKGROUND           = "black" # could be also "white" or "none"
+      DDB_TABLE            = aws_dynamodb_table.cards.name
+      BEDROCK_MODEL_ID     = var.bedrock_llm
+      BEDROCK_REGION       = var.bedrock_region
+      SNS_TOPIC_ARN        = aws_sns_topic.upload_notifications.arn
+      STATIC_CARDS_DIR     = var.static_cards_dir
+      RAW_DOWNLOAD_DIR     = var.raw_download_dir
+      CORNERS_DOWNLOAD_DIR = var.corners_download_dir
+      REVIEW_URL           = "${aws_apigatewayv2_api.admin.api_endpoint}/review"
+    }
+  }
+}
+
+resource "aws_lambda_function" "card_detect" {
+  function_name                  = "BuilderCardsCardDetect"
+  role                           = aws_iam_role.card_detect.arn
+  package_type                   = "Image"
+  image_uri                      = "${aws_ecr_repository.card_detect.repository_url}@${data.aws_ecr_image.card_detect.image_digest}"
+  architectures                  = ["arm64"]
+  memory_size                    = 2048
+  timeout                        = 60
+  reserved_concurrent_executions = 5
+
+  environment {
+    variables = {
+      RAW_PREFIX                    = var.raw_prefix
+      REJECTED_PREFIX               = var.rejected_prefix
+      IMAGE_PROCESSOR_FUNCTION_NAME = aws_lambda_function.image_processor.function_name
+      REJECT_TOPIC_ARN              = aws_sns_topic.reject_notifications.arn
+      KEEP_THRESHOLD                = "0.50"
+      DROP_THRESHOLD                = "0.20"
+    }
+  }
+}
+
+resource "aws_lambda_permission" "card_detect_s3" {
+  statement_id  = "AllowS3Invoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.card_detect.function_name
+  principal     = "s3.amazonaws.com"
+  source_arn    = "arn:aws:s3:::${var.images_bucket_name}"
+}
+
+data "archive_file" "review_editor" {
+  type        = "zip"
+  source_file = "${path.module}/lambda/review-editor/index.py"
+  output_path = "${path.module}/build/review-editor.zip"
+}
+
+resource "aws_lambda_function" "review_editor" {
+  function_name                  = "BuilderCardsReviewEditor"
+  runtime                        = "python3.14"
+  handler                        = "index.handler"
+  role                           = aws_iam_role.review_editor.arn
+  timeout                        = 30
+  reserved_concurrent_executions = 5
+
+  filename         = data.archive_file.review_editor.output_path
+  source_code_hash = data.archive_file.review_editor.output_base64sha256
+
+  environment {
+    variables = {
+      DDB_TABLE               = aws_dynamodb_table.cards.name
+      BASE_PATH               = "/review"
+      BASIC_AUTH_SECRET_ARN   = aws_secretsmanager_secret.review_basic_auth.arn
+      IMAGES_BUCKET           = var.images_bucket_name
+      COMMITTER_FUNCTION_NAME = aws_lambda_function.committer.function_name
+      RAW_PREFIX              = var.raw_prefix
+      REJECTED_PREFIX         = var.rejected_prefix
+    }
+  }
+}
+
+resource "aws_lambda_permission" "review_editor_apigw" {
+  statement_id  = "AllowApiGatewayInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.review_editor.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.admin.execution_arn}/*/*"
+}
+
+data "archive_file" "committer" {
+  type        = "zip"
+  source_file = "${path.module}/lambda/committer/index.py"
+  output_path = "${path.module}/build/committer.zip"
+}
+
+resource "aws_lambda_function" "committer" {
+  function_name = "BuilderCardsCommitter"
+  runtime       = "python3.14"
+  handler       = "index.handler"
+  role          = aws_iam_role.committer.arn
+  timeout       = 30
+
+  filename         = data.archive_file.committer.output_path
+  source_code_hash = data.archive_file.committer.output_base64sha256
+
+  environment {
+    variables = {
+      GITHUB_PAT_SECRET_ARN = aws_secretsmanager_secret.github_pat.arn
+      GITHUB_OWNER          = var.github_owner
+      GITHUB_REPO           = var.github_repo
+      GITHUB_BASE_BRANCH    = var.github_base_branch
+      GITHUB_PUBLISH_BRANCH = var.github_publish_branch
+      IMAGES_BUCKET         = var.images_bucket_name
+      DDB_TABLE             = aws_dynamodb_table.cards.name
+    }
+  }
+}
