@@ -18,6 +18,8 @@ is here.
 
 ## Architecture
 
+![Architecture flow](images/flow-3.png)
+
 ```text
 upload form (static site, separate repo)
    │  POST /get-upload-url         API Gateway — public, no auth
