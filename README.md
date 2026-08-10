@@ -96,28 +96,28 @@ infrastructure/            all Terraform (*.tf)
   lamnbda/
 ```
 -->
-```text
+<pre>
 .
-├── infrastructure                              all Terraform files and lambdas
-│   ├── lambda
-│   │   ├── card-detect                         the gate + build_onnx.py model export. [README](infrastructure/lambda/card-detect/README.md)
+├── <a href="infrastructure/"><b>infrastructure/</b></a>                           <i>all Terraform files and the lambdas</i>
+│   ├── <a href="infrastructure/lambda/"><b>lambda/</b></a>
+│   │   ├── <a href="infrastructure/lambda/card-detect/"><b>card-detect/</b></a>                      <i>the gate + the ONNX model export</i> - <a href="infrastructure/lambda/card-detect/README.md">README</a>
 │   │   │   ├── build_onnx-requirements.txt
 │   │   │   ├── build_onnx.py
 │   │   │   ├── Dockerfile
 │   │   │   ├── index.py
 │   │   │   ├── README.md
 │   │   │   └── requirements.txt
-│   │   ├── committer lambda                    creating markdown and comminting it along with the processed image to the GitHub
+│   │   ├── <a href="infrastructure/lambda/committer/"><b>committer/</b></a>                        <i>writes the markdown and commits it with the image to GitHub</i>
 │   │   │   └── index.py
-│   │   ├── get-upload-url
+│   │   ├── <a href="infrastructure/lambda/get-upload-url/"><b>get-upload-url/</b></a>                   <i>returns the presigned S3 POST</i>
 │   │   │   └── index.py
-│   │   ├── image-processor                     the cleanup pipeline. [README](infrastructure/lambda/image-processor/README.md)
+│   │   ├── <a href="infrastructure/lambda/image-processor/"><b>image-processor/</b></a>                  <i>the cleanup pipeline</i> - <a href="infrastructure/lambda/image-processor/README.md">README</a>
 │   │   │   ├── app.py
 │   │   │   ├── Dockerfile
 │   │   │   ├── README.md
 │   │   │   ├── requirements.txt
 │   │   │   └── test-event.json
-│   │   └── review-editor                       human in the loop lambda, creating a html of all processed images for review 
+│   │   └── <a href="infrastructure/lambda/review-editor/"><b>review-editor/</b></a>                    <i>human in the loop, renders the review page</i>
 │   │       └── index.py
 │   ├── apigw.tf
 │   ├── dynamodb.tf
@@ -132,9 +132,9 @@ infrastructure/            all Terraform (*.tf)
 │   ├── terraform.tfvars
 │   ├── variables.tf
 │   └── versions.tf
-├── AGENTS.md                                  conventions for humans + AI coding agents
-└──  LICENSE
-```
+├── AGENTS.md                                 <i>conventions for humans + AI coding agents</i>
+└── LICENSE
+</pre>
 
 ---
 
