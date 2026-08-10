@@ -20,6 +20,17 @@ is here.
 
 ![Architecture flow](images/flow-3.png)
 
+### The flow
+
+1. User hit `Upload your card` on a website, lamnda `get-upload-url` returns a **presigned S3 POST**, which user use to directly upload the image into s3 bucket's prefix `images/raw`.
+2. Lambda `card-detect` running `CLIP ViT-B-32, laion2b_s34b_b79k` vision model on `onnxruntime`, plus `Pillow`, perform filter. Valid AWS cards stays in `images/raws`, everything else is moved to `images/rejected`.
+3. Lambda `image-processor`, running a model `BiRefNet-General-Lite` via `rembg` on `onnxruntime` along with math tools `OpenCV` and `NumPy` remove the background, straightens the card and crops it. Processed image is sent to `images/finished/`
+4. Same lambda parallelly sends a card image to `Bedrock`, where model `Nova Lite 2` is used to extract the text from it, which is then stored in `DynamoDB` as a card's metadata.
+5. Lambda `review-editor` reads s3 bucket - both `/finished` and `/rejected` prefix, as well as metadate in `DynamoDB`. It creates a html page accessible for the admin through sepparate `API Gateway` where admin have to approve or reject freshly proceesed card.
+6. If approved, lambda `committer` creates the **markdown** file of particular card and commits and push it along with the card's processed picture to the GitHub repo.
+7. `Amplify` running static site generator `Hugo` pulls it grom the GitHub repo, generates the html from the mardown files uplaoded by `commiter` and publish the page to public web.
+
+<!--
 ```text
 upload form (static site, separate repo)
    │  POST /get-upload-url         API Gateway — public, no auth
@@ -46,7 +57,7 @@ committer (zip, holds the GitHub PAT)
    │  one atomic commit: <slug>.md + <cardId>.png → publish branch
    ▼
 GitHub → Amplify rebuilds the Hugo site → deploy-status email
-```
+-->```
 
 Five Lambdas, least privilege:
 
@@ -58,7 +69,7 @@ Five Lambdas, least privilege:
 | `image-processor` | Internal (gate invoke)         | no              |
 | `committer`       | Internal (invoke-only)         | GitHub PAT      |
 
-**Security model:** DynamoDB is the source of truth — the committer re-reads the
+**Security model:** ``DynamoDB` is the source of truth — the `committer` re-reads the
 card and re-verifies `status=approved` itself, never trusting its caller. The
 GitHub PAT (the only credential that can change the public site) lives solely in
 the internal, invoke-only committer, never in the internet-facing review editor.
