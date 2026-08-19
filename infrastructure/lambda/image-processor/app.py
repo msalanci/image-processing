@@ -570,16 +570,30 @@ The JSON must have exactly these keys:
 Read the card from top to bottom.
 
 TASK 1: TITLE
-The title is the card name printed at the top of the card.
-Examples: "AWS Cloud Practitioner", "David".
+The title is the card name. It can have two parts.
+
+Part 1 - the text in the title bar at the top of the card. 
+Always present.
+Read it in full, exactly as printed.
+
+Part 2 - a qualifier printed in its own banner inside the artwork, below the title bar. 
+Only some cards have this. Examples of what it looks like: ASSOCIATE, PROFESSIONAL, FOUNDATIONAL, SPECIALTY.
+
+If a banner like that is visible, the title is Part 1 followed by Part 2, written in normal capitalisation:
+"AWS certified Solutions Architect" + "ASSOCIATE" -> "AWS certified Solutions Architect Associate"
+
+If no such banner is visible, the title is Part 1 alone.
+Do not add a qualifier that is not printed on the card.
+
+Examples: "AWS Cloud Practitioner", "David", "AWS certified Solutions Architect Professional".
 If you cannot read it, use "".
 
 TASK 2: EFFECT
 The effect is the gameplay area in the middle of the card.
 
 The effect area may contain small icons.
-A card can have 1 icon, 2 icons, or 3 icons.
-Not all icon types are always present.
+Not all icon types are always present on s csrd.
+A card may have: 0 icons, or 1 icon, or 2 icons or all 3 icons.
 Only use icons that are actually visible on this card.
 
 There are exactly 3 possible icon types:
