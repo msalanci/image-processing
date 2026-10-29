@@ -10,7 +10,10 @@ description, which are stored in DynamoDB as a pending item for the maintainer's
 email announces the new card.
 
 The rembg model is loaded once per container, at import, and reused by warm invocations; the
-Dockerfile bakes it into the image under U2NET_HOME, so a cold start downloads nothing. HEIC and HEIF
+Dockerfile bakes it into the image under U2NET_HOME, so a cold start downloads nothing. Its
+onnxruntime session runs without the CPU memory arena: with the arena, the ~7 GB a card needs stays
+reserved after the card, and the next card in the same warm container goes past the 10 GB limit and is
+killed for running out of memory. Without it, memory falls back to about 1 GB after every card. HEIC and HEIF
 photos, the iPhone default, decode through Pillow with the pillow-heif opener registered at import;
 its wheel bundles libheif, so the image needs no OS package for it. Without pillow-heif a warning is
 logged and the other formats still work.
@@ -43,6 +46,7 @@ from datetime import datetime, timezone
 import boto3
 import numpy as np
 import cv2
+import onnxruntime as ort
 from rembg import remove, new_session
 from PIL import Image
 
@@ -77,7 +81,9 @@ ddb = boto3.client("dynamodb")
 bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
 sns = boto3.client("sns")
 
-SESSION = new_session(MODEL)
+SESSION_OPTIONS = ort.SessionOptions()
+SESSION_OPTIONS.enable_cpu_mem_arena = False
+SESSION = new_session(MODEL, sess_opts=SESSION_OPTIONS)
 
 
 def get_mask(raw_bytes, session):
