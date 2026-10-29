@@ -7,10 +7,10 @@ rembg[cpu]==2.0.86
 opencv-python-headless==5.0.0.93
 numpy==2.5.4
 
-# pillow 13 moves the cut-out card's edge by a few pixels (invisible); 
+# pillow 13 moves the cut-out card's edge by a few pixels (invisible);
 # 12.3.0 gives output byte-identical to the images built before
 # 13.0.0 removes little more pixels (not visible by human eye)
-# Uncoment which pillow is preffered
+# Uncomment which pillow is preferred
 pillow==13.0.0
 # pillow==12.3.0
 pillow-heif==1.8.1

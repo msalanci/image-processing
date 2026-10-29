@@ -28,7 +28,7 @@ Environment variables:
     BEDROCK_REGION: The region of the Bedrock client (default "eu-central-1").
     SNS_TOPIC_ARN: The topic of the "new card uploaded" email; empty skips the email.
     STATIC_CARDS_DIR, RAW_DOWNLOAD_DIR, CORNERS_DOWNLOAD_DIR: The local folders named in the email's
-        download commands.
+        download commands (default ".", the folder the commands are run in).
     REVIEW_URL: The review-editor link in the email.
 """
 
@@ -67,9 +67,9 @@ BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID")
 BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "eu-central-1")
 
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
-STATIC_CARDS_DIR = os.environ.get("STATIC_CARDS_DIR", "web/awsbuildercards/static/cards")
-RAW_DOWNLOAD_DIR = os.environ.get("RAW_DOWNLOAD_DIR", "card_pictures/RAW")
-CORNERS_DOWNLOAD_DIR = os.environ.get("CORNERS_DOWNLOAD_DIR", "card_pictures/CORNERS")
+STATIC_CARDS_DIR = os.environ.get("STATIC_CARDS_DIR", ".")
+RAW_DOWNLOAD_DIR = os.environ.get("RAW_DOWNLOAD_DIR", ".")
+CORNERS_DOWNLOAD_DIR = os.environ.get("CORNERS_DOWNLOAD_DIR", ".")
 REVIEW_URL = os.environ.get("REVIEW_URL", "")
 
 s3 = boto3.client("s3")
@@ -175,9 +175,11 @@ def find_quad(mask):
 
     The corners are where straight lines fitted to the card's four edges meet, so rounded card corners
     still give sharp ones. Each line is fitted to the middle of its edge only, leaving out 18 % of the
-    side at each end, where the corner bends away, and needs at least 15 points. When that fails, a
-    convex four-point polygon approximation of the largest contour is used, and as a last resort the
-    minimum-area rectangle around it.
+    side at each end, where the corner bends away, and needs at least 15 points. Nearly parallel
+    edges meet far away, so a corner more than 10 % of the photo's longer side outside the photo also
+    counts as a failure; the margin keeps a card whose corner is cut off by the photo's edge. When that
+    fails, a convex four-point polygon approximation of the largest contour is used, and as a last
+    resort the minimum-area rectangle around it.
 
     Args:
         mask: The card's binary mask, from get_mask.
@@ -218,7 +220,11 @@ def find_quad(mask):
         if all(p is not None for p in (tl, tr, br, bl)):
             corners_rot = np.array([tl, tr, br, bl], dtype=np.float32)
             Minv = cv2.invertAffineTransform(M)
-            return _rotate_pts(corners_rot, Minv).astype(np.float32)
+            corners = _rotate_pts(corners_rot, Minv).astype(np.float32)
+            h, w = mask.shape[:2]
+            margin = 0.1 * max(h, w)
+            if np.all((corners >= -margin) & (corners <= np.array([w - 1, h - 1]) + margin)):
+                return corners
 
     peri = cv2.arcLength(c, True)
     for f in [0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10]:
@@ -232,21 +238,22 @@ def find_quad(mask):
 def order_corners(pts):
     """Sort four corner points into top-left, top-right, bottom-right, bottom-left order.
 
+    The points are sorted by their angle around their centroid, which is clockwise on screen because
+    image y points down, and the list starts at the point with the smallest x + y. Unlike picking each
+    corner by the sum or the difference of its coordinates, this uses every point exactly once, also
+    for a card turned near 45 degrees; for an upright card both give the same order.
+
     Args:
         pts: A (4, 2) array of corner points in any order, as find_quad returns them.
 
     Returns:
         A float32 (4, 2) array: top-left, top-right, bottom-right, bottom-left.
     """
-    s = pts.sum(axis=1)
-    d = np.diff(pts, axis=1).reshape(-1)
+    c = pts.mean(axis=0)
+    ring = pts[np.argsort(np.arctan2(pts[:, 1] - c[1], pts[:, 0] - c[0]))]
+    start = int(np.argmin(ring.sum(axis=1)))
 
-    tl = pts[np.argmin(s)]
-    br = pts[np.argmax(s)]
-    tr = pts[np.argmin(d)]
-    bl = pts[np.argmax(d)]
-
-    return np.float32([tl, tr, br, bl])
+    return np.float32(np.roll(ring, -start, axis=0))
 
 
 def rectify(img_bgr, quad, mask, background="white"):
@@ -496,11 +503,11 @@ Read the card from top to bottom.
 TASK 1: TITLE
 The title is the card name. It can have two parts.
 
-Part 1 - the text in the title bar at the top of the card. 
+Part 1 - the text in the title bar at the top of the card.
 Always present.
 Read it in full, exactly as printed.
 
-Part 2 - a qualifier printed in its own banner inside the artwork, below the title bar. 
+Part 2 - a qualifier printed in its own banner inside the artwork, below the title bar.
 Only some cards have this. Examples of what it looks like: ASSOCIATE, PROFESSIONAL, FOUNDATIONAL, SPECIALTY.
 
 If a banner like that is visible, the title is Part 1 followed by Part 2, written in normal capitalisation:
@@ -516,7 +523,7 @@ TASK 2: EFFECT
 The effect is the gameplay area in the middle of the card.
 
 The effect area may contain small icons.
-Not all icon types are always present on s csrd.
+Not all icon types are always present on a card.
 A card may have: 0 icons, or 1 icon, or 2 icons or all 3 icons.
 Only use icons that are actually visible on this card.
 
@@ -526,7 +533,7 @@ ICON TYPE 1: CREDIT
 Visual appearance: orange circle contains a white number. That number has NO plus sign.
 Example: orange circle with "1"
 This icon can be small, so look carefully.
-Meaning: "Get N credit", if N = 1.
+Meaning: "Get N credit" if N = 1. "Get N credits" if N > 1.
 
 ICON TYPE 2: DRAW CARDS
 Visual appearance: black rounded rectangle contains a white number. the number ALWAYS has a plus sign, like "+1" or "+2"
@@ -558,7 +565,7 @@ If there is no text after the icon, use only the icon meaning.
 
 Read all visible effect icons from top to bottom.
 For each visible icon, create one effect sentence.
-Join multiple effect sentences using \n inside the JSON string.
+Join multiple effect sentences using \\n inside the JSON string.
 
 TASK 3: DESCRIPTION
 The description is the smaller text near the bottom of the card.
@@ -785,8 +792,7 @@ def publish_upload_notification(bucket, finished_key, card_id, event_name, year,
 
     if raw_key:
         raw_name = raw_key.split("/")[-1]
-        base = raw_key.rsplit(".", 1)[0] if "." in raw_key else raw_key
-        corners_obj_key = base + "__corners.png"
+        corners_obj_key = corners_key(raw_key)
         corners_name = corners_obj_key.split("/")[-1]
         original_cmd = (
             "# 1) Original photo\n"
@@ -820,12 +826,7 @@ Upload Time: {event_time or "Unknown"}
 {download_block}
 
 === ACCESS THE CARD DETAILS ===
-{REVIEW_URL or "(review URL not configured)"}
-
-=== DB VERIFICATION ===
-verify the DB values at:
-source local-tools/card-editor/.venv/bin/activate
-python local-tools/card-editor/review.py"""
+{REVIEW_URL or "(review URL not configured)"}"""
 
     try:
         sns.publish(
@@ -852,9 +853,10 @@ def handler(event, context):
     x-amz-meta-uploader field of the pre-signed POST, and boto3 returns user metadata keys lowercased
     and without the x-amz-meta- prefix.
 
-    The Bedrock draft, the DynamoDB write, the overlay write and the email are best-effort: a failure
-    is logged and the record goes on. Any other failure ends that record with status "error", and the
-    next record is processed.
+    The Bedrock draft, the overlay write and the email are best-effort: a failure is logged and the
+    record goes on. Any other failure ends that record with status "error", and the next record is
+    processed. The DynamoDB item is written before the cleaned image and the email, so a failed write
+    never announces a card that the review list does not show.
 
     When any record failed, the function raises after the loop. card-detect invokes it
     asynchronously, and Lambda retries an asynchronous event only when the function fails, so
@@ -929,11 +931,8 @@ def handler(event, context):
                 logger.info("[ImageProcessor] extracted title=%r", fields.get("title", ""))
             except Exception as ex:  # noqa: BLE001
                 logger.exception("[ImageProcessor] Bedrock extraction failed: %s", ex)
-            try:
-                write_card_item(card_id, event_name, year, key, out_key, fields, uploader)
-                logger.info("[ImageProcessor] wrote DynamoDB item cardId=%s (pending)", card_id)
-            except Exception as ex:  # noqa: BLE001
-                logger.exception("[ImageProcessor] DynamoDB write failed: %s", ex)
+            write_card_item(card_id, event_name, year, key, out_key, fields, uploader)
+            logger.info("[ImageProcessor] wrote DynamoDB item cardId=%s (pending)", card_id)
 
             s3.put_object(
                 Bucket=bucket,
