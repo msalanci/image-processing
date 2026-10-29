@@ -140,6 +140,22 @@ resource "aws_iam_role_policy" "image_processor_sns" {
   })
 }
 
+resource "aws_iam_role_policy" "image_processor_failed_events" {
+  name = "BuilderCardsImageProcessorSendFailedEvents"
+  role = aws_iam_role.image_processor.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "SendFailedEventsToQueue"
+        Effect   = "Allow"
+        Action   = ["sqs:SendMessage"]
+        Resource = aws_sqs_queue.failed_events.arn
+      }
+    ]
+  })
+}
+
 resource "aws_iam_role" "committer" {
   name               = "BuilderCardsCommitterRole"
   assume_role_policy = data.aws_iam_policy_document.lambda_assume_role.json
@@ -397,6 +413,22 @@ resource "aws_iam_role_policy" "card_detect_sns" {
         Effect   = "Allow"
         Action   = ["sns:Publish"]
         Resource = aws_sns_topic.reject_notifications.arn
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "card_detect_failed_events" {
+  name = "BuilderCardsCardDetectSendFailedEvents"
+  role = aws_iam_role.card_detect.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "SendFailedEventsToQueue"
+        Effect   = "Allow"
+        Action   = ["sqs:SendMessage"]
+        Resource = aws_sqs_queue.failed_events.arn
       }
     ]
   })
