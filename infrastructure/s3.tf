@@ -43,8 +43,8 @@ resource "aws_s3_bucket_ownership_controls" "images" {
 resource "aws_s3_bucket_cors_configuration" "images" {
   bucket = aws_s3_bucket.images.id
   cors_rule {
-    allowed_methods = ["PUT", "POST"]
-    allowed_origins = ["*"]
+    allowed_methods = ["POST"]
+    allowed_origins = var.allowed_origins
     allowed_headers = ["*"]
     max_age_seconds = 3000
   }

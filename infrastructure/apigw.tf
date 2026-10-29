@@ -12,7 +12,7 @@ resource "aws_apigatewayv2_api" "upload" {
   protocol_type = "HTTP"
 
   cors_configuration {
-    allow_origins = ["*"]
+    allow_origins = var.allowed_origins
     allow_methods = ["POST", "OPTIONS"]
     allow_headers = ["*"]
   }
