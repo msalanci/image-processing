@@ -10,6 +10,13 @@ resource "aws_dynamodb_table" "cards" {
   name         = "BuilderCards"
   billing_mode = "PAY_PER_REQUEST"
 
+  deletion_protection_enabled = true
+
+  point_in_time_recovery {
+    enabled                 = true
+    recovery_period_in_days = 35
+  }
+
   hash_key = "cardId"
 
   attribute {

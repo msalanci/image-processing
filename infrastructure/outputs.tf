@@ -2,7 +2,8 @@
 # Copyright (c) 2026 Michal Salanci
 #
 # Outputs of the stack: the images bucket and its prefixes, the upload Lambda and its API
-# endpoint, the review editor URL, and the ARNs of the live SNS notification topics.
+# endpoint, the review editor URL, the ARNs of the live SNS notification topics, and the queue
+# of failed upload events.
 
 output "images_bucket_name" {
   description = "Name of the BuilderCards images bucket"
@@ -50,6 +51,11 @@ output "reject_notification_topic_arn" {
 }
 
 output "review_editor_url" {
-  description = "Open this in a browser to review/approve cards (hosted review.py, dedicated admin API)."
+  description = "Open this in a browser to review/approve cards (the review editor, on its own admin API)."
   value       = "${aws_apigatewayv2_api.admin.api_endpoint}/review"
+}
+
+output "failed_events_queue_url" {
+  description = "URL of the SQS queue that keeps, for 14 days, the upload events card-detect or the image-processor still failed on after Lambda's retries"
+  value       = aws_sqs_queue.failed_events.url
 }

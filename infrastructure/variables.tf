@@ -59,6 +59,16 @@ variable "amplify_app_id" {
   }
 }
 
+variable "allowed_origins" {
+  description = "Web origins of the site whose upload form may call the upload API and post photos to the images bucket from the browser (CORS), such as [\"https://www.example.com\"]. Each is https://, a lowercase host name and an optional port, with no path or trailing slash; list every domain the form is served from, the Amplify default domain included if you use it. Set in terraform.tfvars."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.allowed_origins) > 0 && alltrue([for origin in var.allowed_origins : can(regex("^https://[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+(:[0-9]{1,5})?$", origin))])
+    error_message = "The allowed origins must be a non-empty list of https:// origins in lowercase, each without a path or trailing slash, such as https://www.example.com."
+  }
+}
+
 variable "aws_region" {
   description = "AWS region to deploy into. Frontend currently points at eu-central-1."
   type        = string
@@ -115,21 +125,21 @@ variable "rejected_prefix" {
 }
 
 variable "static_cards_dir" {
-  description = "Repo-relative destination dir used in the SNS download command (where the finished card PNG should be copied for the Hugo site)."
+  description = "Local folder that the 'new card' email's download command copies the finished card image into, relative to where you run the command, such as the static/cards folder of your site's checkout. The default, ., is the folder you run it in."
   type        = string
-  default     = "web/awsbuildercards/static/cards"
+  default     = "."
 }
 
 variable "raw_download_dir" {
-  description = "Repo-relative destination dir for the original-photo download command in the SNS email."
+  description = "Local folder that the 'new card' email's download command copies the original photo into, relative to where you run the command. The default, ., is the folder you run it in."
   type        = string
-  default     = "card_pictures/RAW"
+  default     = "."
 }
 
 variable "corners_download_dir" {
-  description = "Repo-relative destination dir for the corners-overlay download command in the SNS email."
+  description = "Local folder that the 'new card' email's download command copies the corners overlay into, relative to where you run the command. The default, ., is the folder you run it in."
   type        = string
-  default     = "card_pictures/CORNERS"
+  default     = "."
 }
 
 variable "bedrock_llm" {
@@ -149,20 +159,31 @@ variable "bedrock_region" {
   }
 }
 
-variable "github_base_branch" {
-  description = "Your live / deploy branch — the branch Amplify builds and publishes the site from (e.g. master). In the full-auto single-branch setup the committer commits straight to this branch (set github_publish_branch to the same value). The default, master, agrees with the defaults of github_publish_branch and amplify_branch_name; keep all three on the same branch. Override in terraform.tfvars."
-  type        = string
-  default     = "master"
-}
-
 variable "github_publish_branch" {
-  description = "Branch the committer Lambda commits published cards to (must already exist in the repo — the GitHub Contents API won't create it). FULL-AUTO: set this equal to github_base_branch (your live branch) so approved cards deploy with no manual merge; the default, master, does that out of the box. PR-GATED alternative: set it to a separate staging branch you merge into the live branch yourself (the live branch can then keep 'require a PR' protection). Override in terraform.tfvars."
+  description = "Branch the committer Lambda commits published cards to (must already exist in the repo — the GitHub Contents API won't create it). FULL-AUTO: set this to your live branch, the one Amplify builds (amplify_branch_name), so approved cards deploy with no manual merge; the default, master, does that out of the box. PR-GATED alternative: set it to a separate staging branch you merge into the live branch yourself (the live branch can then keep 'require a PR' protection). Override in terraform.tfvars."
   type        = string
   default     = "master"
 }
 
 variable "amplify_branch_name" {
-  description = "Amplify branch whose deploys trigger the SNS3 email (your live/deploy branch, normally equal to github_base_branch). The EventBridge rule matches it exactly, so a mismatch such as main versus master silently drops the deploy email while the site still builds. Defaults to master. Override in terraform.tfvars."
+  description = "Amplify branch whose deploys trigger the SNS3 email (your live/deploy branch, normally equal to github_publish_branch). The EventBridge rule matches it exactly, so a mismatch such as main versus master silently drops the deploy email while the site still builds. Defaults to master. Override in terraform.tfvars."
   type        = string
   default     = "master"
+}
+
+variable "lambda_log_retention_days" {
+  description = "Days CloudWatch Logs keeps the logs of each Lambda function before deleting them. Defaults to 90."
+  type        = number
+  default     = 90
+
+  validation {
+    condition     = contains([1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653], var.lambda_log_retention_days)
+    error_message = "The log retention must be a period CloudWatch Logs accepts: 1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288 or 3653 days."
+  }
+}
+
+variable "import_existing_log_groups" {
+  description = "Set to true when the Lambda functions were deployed by a version of this stack that did not manage their log groups: Lambda then created the /aws/lambda/<function> log groups itself, and Terraform imports them instead of failing to create them. Leave false for a new deployment, where an import would fail because the log groups do not exist yet. Once they are in the state, either value is safe."
+  type        = bool
+  default     = false
 }
