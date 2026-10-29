@@ -1,22 +1,38 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Michal Salanci
 
-"""
-BUILD-TIME export (uses PyTorch) — run this ONCE to produce the artifacts the torch-free runtime (detect_card.py) needs:
-    onnx_out/visual.onnx   the ViT-B/32 (laion2b) IMAGE encoder, exported to ONNX
-    onnx_out/text.npz      precomputed label text-embeddings + logit_scale + the
-                           card/non-card split (so the runtime needs no text
-                           encoder and no tokenizer)
+"""Build-time export of the model files that the card-detect Lambda image bakes in.
 
-WHY THIS SPLIT:
-PyTorch too heavy for a lambda (~2 GB image, slow cold start). 
-So we pay torch ONCE here to export, and the runtime then uses only onnxruntime + numpy,
-the exact shape you'd ship in the image-processor container (which already has onnxruntime for BiRefNet).
+It runs with PyTorch on a build machine, never in Lambda, and writes into onnx_out/ next to this
+file:
 
-Run:
-    source .venv/bin/activate
+    onnx_out/visual.onnx   the open_clip ViT-B/32 (laion2b) image encoder in ONNX, with its
+                           weights in onnx_out/visual.onnx.data
+    onnx_out/text.npz      the normalised label text embeddings, logit_scale, aws_count,
+                           card_count and the label phrases
+
+so that index.py needs only onnxruntime and numpy, with no PyTorch, text encoder or tokenizer.
+The Dockerfile copies these files into the image. Re-run it whenever the labels or the model
+change; the labels here are the gate's single source of truth.
+
+The labels come in three groups, kept in this order because index.py slices the softmax by the
+group counts:
+    AWS_LABELS         the positive class; p_aws is the softmax mass over these. They describe
+                       visual cues (the pixel-art icon, the service name, the QR code), which
+                       scored better than a brand name alone.
+    COMPETITOR_LABELS  other card types, each named so that CLIP puts their probability there
+                       instead of on the AWS labels, which keeps p_aws low for them. Adding a
+                       label here pushes another card type down.
+    NONCARD_LABELS     images that are not cards at all.
+p_any_card is the mass over the AWS and competitor groups; index.py uses it only to label a
+rejection, never to gate.
+
+MODEL and PRETRAINED name the model of the PyTorch reference run that the ONNX export was
+parity-checked against. Changing them changes every score, so the score cutoffs must be measured
+again. IMAGE_SIZE must equal IMAGE_SIZE in index.py.
+
+Run, in a virtual environment with build_onnx-requirements.txt installed:
     python build_onnx.py
-Produces ./onnx_out/. Re-run whenever you change the labels or the model.
 """
 
 import os
@@ -27,28 +43,15 @@ import open_clip
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT_DIR = os.path.join(HERE, "onnx_out")
 
-# MUST match the model the PyTorch test used (so the ONNX run is a true parity check against results.csv)
-# and MUST match the labels in that run.
 MODEL = "ViT-B-32"
 PRETRAINED = "laion2b_s34b_b79k"
-IMAGE_SIZE = 224  # ViT-B/32 input resolution
+IMAGE_SIZE = 224
 
-# Label phrases, in 3 groups (order matters — see the counts saved below):
-#   AWS_LABELS
-#   COMPETITOR_LABELS
-#   NONCARD_LABELS
-# p_card (any card) = mass over AWS + competitor. 
-# 
-# The runtime (index.py) GATES on p_aws: p_aws >= DROP -> pipeline; 
-# p_aws < DROP -> rejected. 
-# p_card only LABELS a rejection "non-aws-card" (real card, wrong kind) vs "not-a-card" (cat/house).
 AWS_LABELS = [
     "an AWS cloud computing trading card",
     "a tech company card with a pixel-art icon, a service name and a QR code",
     "a software product promotional trading card",
 ]
-# Competitor card types to subtract points from (each named so CLIP parks its probability here, not on the AWS labels). 
-# Add more types as needed.
 COMPETITOR_LABELS = [
     "a Pokemon trading card",
     "a Magic: The Gathering trading card",
@@ -63,7 +66,6 @@ COMPETITOR_LABELS = [
     "a sports trading card with a photo of an athlete",
     "a collectible game card with fantasy artwork",
 ]
-# Anything not being a card of any kind
 NONCARD_LABELS = [
     "a photo of a person",
     "a selfie",
@@ -77,32 +79,34 @@ NONCARD_LABELS = [
     "a cartoon or meme image",
     "a photo of a room or building",
 ]
-# Order: AWS first, then competitors, then non-card (the runtime slices by count).
 ALL_LABELS = AWS_LABELS + COMPETITOR_LABELS + NONCARD_LABELS
 
 
 def main():
-    """
-    Exports the two artifacts the torch-free runtime needs, and writes them to onnx_out/.
+    """Export the image encoder to ONNX and the label embeddings to text.npz, in onnx_out/.
 
-    The CLIP model is loaded once with PyTorch and put in evaluation mode. 
-    Its image encoder is traced with a dummy input and exported to ONNX, so the runtime can produce image embeddings with onnxruntime alone. 
+    open_clip downloads the pretrained weights on first use. Only model.visual is exported: it
+    returns the same projected image embedding as encode_image, and the text tower is not needed
+    at runtime. The batch axis is dynamic, although index.py sends one image at a time. The label
+    embeddings are L2-normalised here, so the runtime's dot product with them is a cosine
+    similarity.
 
     Args:
-        None. Configuration comes from the module-level MODEL, PRETRAINED, IMAGE_SIZE and label constants above.
+        None. Configuration comes from the module-level MODEL, PRETRAINED, IMAGE_SIZE and label
+        constants above.
 
     Returns:
-        None. Writes onnx_out/visual.onnx and onnx_out/text.npz as a side effect, and prints the path and label counts for each.
+        None. Writes onnx_out/visual.onnx (with onnx_out/visual.onnx.data) and onnx_out/text.npz
+        next to this file, creating onnx_out/ when it is missing, and prints its progress: each
+        path it wrote, the label counts and the logit scale.
     """
 
-    # Load the CLIP model and tokenizer
     os.makedirs(OUT_DIR, exist_ok=True)
     print(f"Loading {MODEL} / {PRETRAINED} (PyTorch, build-time only)...")
     model, _, _ = open_clip.create_model_and_transforms(MODEL, pretrained=PRETRAINED)
     tokenizer = open_clip.get_tokenizer(MODEL)
     model.eval()
 
-    # Export the image encoder to ONNX
     visual_path = os.path.join(OUT_DIR, "visual.onnx")
     dummy = torch.zeros(1, 3, IMAGE_SIZE, IMAGE_SIZE, dtype=torch.float32)
     torch.onnx.export(
@@ -111,20 +115,17 @@ def main():
         visual_path,
         input_names=["image"],
         output_names=["embed"],
-        # allow variable batch size (runtime sends 1 at a time)
         dynamic_axes={"image": {0: "batch"}, "embed": {0: "batch"}},
         opset_version=17,
     )
     print(f"  wrote {visual_path}")
 
-    # Precompute the label text-embeddings
     with torch.no_grad():
         tf = model.encode_text(tokenizer(ALL_LABELS))
         tf = tf / tf.norm(dim=-1, keepdim=True)
     text_embeds = tf.numpy().astype(np.float32)
     logit_scale = float(model.logit_scale.exp())
 
-    # Save the vectors plus the counts
     text_path = os.path.join(OUT_DIR, "text.npz")
     np.savez(
         text_path,

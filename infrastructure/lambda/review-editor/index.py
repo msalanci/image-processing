@@ -1,27 +1,40 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Michal Salanci
+"""The hosted BuilderCards card editor: the maintainer's review UI, run as a Lambda.
 
-"""The one page in this pipeline a human touches: review a card, then approve it.
+The dedicated admin HTTP API (BuilderCardsAdminApi, payload format 2.0) invokes it; the public
+upload API is a different Lambda. Every route lives under BASE_PATH (default "/review"):
 
-Serves server-rendered HTML behind its own admin API. 
-Each card is shown with a preview of its finished image and the model's drafts pre-filled into editable fields; 
-saving a card whose status is "approved" asks the committer lambda to publish it. 
-A Rejected tab lists the quarantined uploads straight from S3, since those never got a database record.
+- GET /review lists the cards (pending, approved or all); with ?status=rejected it shows the
+  Rejected tab instead.
+- GET /review/edit shows the edit form of one card.
+- POST /review/save saves the edits and, while the card is approved, publishes it.
+- GET and POST /review/delete confirm, then delete a card everywhere.
+- POST /review/reprocess sends a rejected upload back into the processing path.
+- GET and POST /review/reject-delete confirm, then delete a rejected upload.
 
-Functions:
-    handler: Entry point; authorises the request and routes it.
-    handle_save: Saves edits and publishes the card when it is approved.
-    handle_delete: Asks the committer to remove a card everywhere.
+Every route is gated by HTTP Basic Auth, which fails closed, and every POST needs a valid CSRF
+token. Publishing and deleting a card are done by the internal committer Lambda, which this editor
+invokes synchronously with nothing but an action and a cardId. The editor holds no GitHub token and
+no power to delete cards, so a compromise of this internet-facing function cannot reach the
+repository or purge data. The Rejected tab works on S3 directly: a rejected upload has no DynamoDB
+item, so the picture in S3 is all there is.
 
-Environment (set by Terraform):
-    DDB_TABLE               card table (default BuilderCards)
-    BASE_PATH               prefix the routes live under (default /review)
-    BASIC_AUTH_SECRET_ARN   Secrets Manager ARN of the {username, password} JSON
-    IMAGES_BUCKET           private bucket the image previews are signed against
-    COMMITTER_FUNCTION_NAME the only function this editor may invoke
-    REJECTED_PREFIX         quarantine prefix the Rejected tab lists
-    RAW_PREFIX              prefix a re-submitted image is put back into
-    AWS_REGION              provided automatically by the Lambda runtime
+Environment variables, set by Terraform:
+    DDB_TABLE: The card table (default "BuilderCards").
+    BASE_PATH: The URL prefix that every route, link and form action is built from, so the pages
+        work behind it (default "/review").
+    BASIC_AUTH_SECRET_ARN: The Secrets Manager secret holding JSON
+        {"username": ..., "password": ...}. Both values are read at runtime, so neither is in the
+        environment or the Terraform state.
+    IMAGES_BUCKET: The private images bucket, for pre-signed previews and the rejected uploads.
+    COMMITTER_FUNCTION_NAME: The committer Lambda, invoked to publish or delete a card.
+    REJECTED_PREFIX: The quarantine prefix of rejected uploads (default "images/rejected/").
+    RAW_PREFIX: The upload prefix that triggers the card-detect gate (default "images/raw/").
+    AWS_REGION: Set by the Lambda runtime.
+
+It writes edited fields and publish state to existing DynamoDB items (never new ones), and moves or
+deletes objects under the rejected prefix. It returns HTML pages, redirects and auth challenges.
 """
 
 import os
@@ -41,28 +54,32 @@ import boto3
 TABLE = os.environ.get("DDB_TABLE", "BuilderCards")
 REGION = os.environ.get("AWS_REGION", "eu-central-1")
 BASE = os.environ.get("BASE_PATH", "/review")
+
 BASIC_AUTH_SECRET_ARN = os.environ.get("BASIC_AUTH_SECRET_ARN", "")
+
 IMAGES_BUCKET = os.environ.get("IMAGES_BUCKET", "")
+
 COMMITTER_FUNCTION_NAME = os.environ.get("COMMITTER_FUNCTION_NAME", "")
+
 REJECTED_PREFIX = os.environ.get("REJECTED_PREFIX", "images/rejected/")
 RAW_PREFIX = os.environ.get("RAW_PREFIX", "images/raw/")
+# Must stay equal to FORCE_PROCESS_META in the card-detect gate, which forwards an object carrying
+# this metadata key without scoring it again.
 FORCE_PROCESS_META = "force-process"
 REJECTED_URL_TTL = 3600
 
 ddb = boto3.client("dynamodb", region_name=REGION)
 secretsmanager = boto3.client("secretsmanager", region_name=REGION)
 s3 = boto3.client("s3", region_name=REGION)
-lambda_client = boto3.client("lambda", region_name=REGION)  # invokes the committer
+lambda_client = boto3.client("lambda", region_name=REGION)
 
-# Credentials time for credentials
 CREDS_TTL_SECONDS = 300
-_credentials = None  # cached {"username","password"}
+_credentials = None
 _credentials_fetched_at = 0.0
 
-# Editable fields in the form - stored in DynamoDB
+
 EDITABLE = ["title", "slug", "weight", "event", "year", "effect", "description", "category", "subcategory", "uploader", "status"]
 
-# AI draft fields shown read-only next to their editable counterpart
 DRAFTS = {
     "title": "title_ai_draft",
     "slug": "slug_ai_draft",
@@ -70,7 +87,6 @@ DRAFTS = {
     "description": "description_ai_draft",
 }
 
-# Long text fields render as <textarea>, the rest as <input>
 MULTILINE = {"effect", "description"}
 
 
@@ -78,8 +94,9 @@ def _s(item, key):
     """
     Reads a string attribute out of a raw DynamoDB item.
 
-    The low-level client wraps every value in a type descriptor, so a string lives at item[key]["S"]. 
-    A missing item or attribute gives an empty string, not an error.
+    The low-level client wraps every attribute in a type descriptor, so a string lives at
+    item[key]["S"]. This unwraps it and returns an empty string when the item is None or the
+    attribute is absent, so callers never have to guard each field individually.
 
     Args:
         item: Raw DynamoDB item dict, or None.
@@ -93,10 +110,13 @@ def _s(item, key):
 
 def list_cards(status_filter=None):
     """
-    Fetches every card, optionally narrowed to one status.
+    Fetches every card item, optionally narrowed to a single status.
 
-    A status query reads only its own partition of the index; without one it scans the table, which is fine at this size. 
-    Both paths page to the end, so nothing is silently truncated.
+    When a status is given this queries the status-index GSI, which is cheap and reads only the
+    matching partition; without one it falls back to a full table scan, which is acceptable at this
+    catalog's size. Both paths follow LastEvaluatedKey to the end, so a result set larger than
+    DynamoDB's 1 MB page limit is returned complete rather than silently truncated. Results are
+    sorted by status and then creation time, which is the order the list view renders.
 
     Args:
         status_filter: Optional status to filter by, e.g. "pending" or "approved".
@@ -149,17 +169,21 @@ def get_card(card_id):
 
 def _finished_image_url(item, expires=3600):
     """
-    Builds a short-lived pre-signed URL for a card's finished image.
+    Builds a short-lived pre-signed URL for a card's processed image.
 
-    Signing it lets the page show the image without the bucket being public or the bytes passing through this function. 
-    A failure gives an empty string, so a missing image is a blank preview rather than a broken page.
+    The images bucket is private, so the browser cannot fetch the picture directly. Signing it with
+    the Lambda's own role lets the review page display the image inline and open it in a new tab
+    without making the bucket public or proxying the bytes through this function. Any failure
+    returns an empty string rather than raising, so a missing image degrades to a blank preview
+    instead of breaking the whole page.
 
     Args:
         item: Raw DynamoDB card item, read for its finishedKey.
         expires: URL lifetime in seconds.
 
     Returns:
-        The pre-signed GET URL, or an empty string if there is no image or signing failed.
+        The pre-signed GET URL, or an empty string if the card has no finishedKey, the bucket is
+        not configured or signing failed.
     """
     key = _s(item, "finishedKey")
     if not key or not IMAGES_BUCKET:
@@ -176,10 +200,13 @@ def _finished_image_url(item, expires=3600):
 
 def _finished_size_mb(item):
     """
-    Reads the size of a card's finished image, for the review list.
+    Reads the size of a card's processed image for display in the review UI.
 
-    HeadObject needs no permission beyond the read already granted, and does not download the object. 
-    Anything unreadable shows as a dash.
+    This uses HeadObject, which needs only s3:GetObject — already granted on the finished prefix —
+    so showing the size costs no extra IAM permission and does not download the object. The value
+    shown is the processed PNG, which is the counterpart of the byte size displayed for rejected
+    uploads (those are the un-processed originals). A missing or unreadable object degrades to a
+    dash rather than an error.
 
     Args:
         item: Raw DynamoDB card item, read for its finishedKey.
@@ -193,7 +220,7 @@ def _finished_size_mb(item):
     try:
         resp = s3.head_object(Bucket=IMAGES_BUCKET, Key=key)
         return f"{resp['ContentLength'] / 1048576:.2f} MB"
-    except Exception:  # noqa: BLE001 - missing/unreadable -> just show a dash
+    except Exception:  # noqa: BLE001
         return "—"
 
 
@@ -201,22 +228,24 @@ def update_card(card_id, values):
     """
     Writes the edited fields back to a card and stamps updatedAt.
 
-    UpdateItem is an upsert, so the condition matters: without it a post carrying 
-    a bogus cardId would quietly create a junk card instead of failing.
+    The update expression is built dynamically from whatever fields were submitted, using
+    placeholder names and values so that a field named like a DynamoDB reserved word cannot break
+    the expression. Every value is stored as a DynamoDB string. A condition on
+    attribute_exists(cardId) is essential rather than cosmetic: UpdateItem is an upsert, so without
+    it a POST carrying a bogus cardId would silently CREATE a junk card instead of failing.
 
     Args:
         card_id: Identifier of the card to update.
         values: Mapping of field name to new string value.
 
     Returns:
-        None.
+        None. The fields and a fresh updatedAt timestamp are written to the card's DynamoDB item.
 
     Raises:
-        ConditionalCheckFailedException: If no card with that id exists.
+        ddb.exceptions.ConditionalCheckFailedException: If no card with that id exists.
     """
     from datetime import datetime, timezone
 
-    # Build SET clauses from placeholders, so reserved words cannot break the expression
     names = {}
     vals = {}
     sets = []
@@ -224,8 +253,6 @@ def update_card(card_id, values):
         names[f"#f{i}"] = field
         vals[f":v{i}"] = {"S": value}
         sets.append(f"#f{i} = :v{i}")
-
-    # Always bump the edit timestamp alongside the submitted fields
     names["#ua"] = "updatedAt"
     vals[":ua"] = {"S": datetime.now(timezone.utc).isoformat()}
     sets.append("#ua = :ua")
@@ -236,19 +263,25 @@ def update_card(card_id, values):
         UpdateExpression="SET " + ", ".join(sets),
         ExpressionAttributeNames=names,
         ExpressionAttributeValues=vals,
-        
-        # Refuse to CREATE a new item
         ConditionExpression="attribute_exists(cardId)",
     )
 
 
 def set_publish_state(card_id, status, url="", error=""):
     """
-    Records the outcome of a publish attempt on the card item.
+    Records the outcome of a GitHub publish attempt on the card item.
 
-    Without this a failed publish is invisible: the card reads "approved" forever while never reaching the site. 
-    publishedAt is written only on success, so that field never lies. 
-    The whole write is best effort, because it must never mask the publish result it is reporting.
+    Without this bookkeeping a failed publish is invisible: the card sits as "approved" forever
+    while never actually reaching the site. Writing the outcome makes the failure both visible in
+    the review UI and retryable. Four attributes are maintained — publishStatus (pending, published
+    or failed), githubPublishedUrl on success, githubPublishError on failure (truncated, because
+    GitHub and HTTP error strings can be very long), and publishedAt, set only on success.
+    It needs no IAM beyond the UpdateItem the editor holds for its edits, and the editor owns this
+    bookkeeping because it is the component that receives the publish result synchronously — the
+    committer never writes publish state. The write carries the same attribute_exists(cardId)
+    condition as update_card(), so bookkeeping never creates a row.
+    The whole write is best effort. A failure here must never mask the actual publish result, so it
+    is caught and logged rather than raised.
 
     Args:
         card_id: Identifier of the card that was published.
@@ -257,7 +290,8 @@ def set_publish_state(card_id, status, url="", error=""):
         error: Error description, on failure; truncated to 500 characters.
 
     Returns:
-        None.
+        None. The publish attributes are written to the card's DynamoDB item; a failed write is only
+        printed to the log.
     """
     from datetime import datetime, timezone
 
@@ -281,17 +315,23 @@ def set_publish_state(card_id, status, url="", error=""):
             ExpressionAttributeValues=vals,
             ConditionExpression="attribute_exists(cardId)",
         )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"[review-editor] set_publish_state({card_id}, {status}) failed: {e}")
 
 
 def _invoke_committer(action, card_id):
     """
-    Invokes the committer, which owns the GitHub token and the delete power.
+    Synchronously invokes the internal committer Lambda, which owns the privileged operations.
 
-    The payload is two strings and nothing else: the committer re-reads the card itself and re-checks approval, 
-    so nothing sent from here is trusted as content. 
-    Both transport failures and refusals come back as an error string, so the caller handles them one way.
+    The committer holds the GitHub token and the delete power; this internet-facing editor holds
+    neither, and has only lambda:InvokeFunction on that one function. The payload deliberately
+    carries nothing but an action and a cardId — the committer re-reads the card from DynamoDB
+    itself and, when publishing, re-verifies that its status is "approved", so nothing this
+    function sends is ever trusted as content. That separation is what lets the review UI be
+    exposed to the internet without exposing the credentials behind it.
+    The invoke is synchronous because the caller needs the outcome to record publish state and show
+    the result. Both transport failures and application-level errors are returned as strings rather
+    than raised, so the caller has one uniform way to handle them.
 
     Args:
         action: Either "publish" or "delete".
@@ -303,29 +343,28 @@ def _invoke_committer(action, card_id):
     if not COMMITTER_FUNCTION_NAME:
         return None, "committer not configured"
 
-    # Send only the action and the id, the committer sources everything else itself
     try:
         resp = lambda_client.invoke(
             FunctionName=COMMITTER_FUNCTION_NAME,
             InvocationType="RequestResponse",
             Payload=json.dumps({"action": action, "cardId": card_id}).encode("utf-8"),
         )
-        # Distinguish a crashed invocation from a clean refusal
         payload = json.loads(resp["Payload"].read() or "{}")
         if resp.get("FunctionError"):
             return None, f"committer error: {payload}"
         if payload.get("error"):
             return None, payload["error"]
         return payload, None
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return None, str(e)
 
 
 def _invoke_publisher(card_id):
     """
-    Publishes a card by asking the committer to commit it.
+    Publishes a card by asking the committer to commit it to GitHub.
 
-    Unwraps the committer's response down to the one value the caller needs.
+    A thin wrapper over _invoke_committer() that sends the publish action and unwraps the response
+    down to the single value handle_save() needs.
 
     Args:
         card_id: Identifier of the approved card to publish.
@@ -343,6 +382,8 @@ def _invoke_deleter(card_id):
     """
     Removes a card everywhere by asking the committer to delete it.
 
+    A thin wrapper over _invoke_committer() that sends the delete action, used by handle_delete().
+
     Args:
         card_id: Identifier of the card to remove.
 
@@ -357,16 +398,19 @@ def _list_rejected():
     """
     Lists the quarantined uploads straight from S3, for the Rejected tab.
 
-    These never reached DynamoDB, because the gate quarantined them before any record existed, 
-    so the bucket prefix is all there is to read. 
-    Placeholders and debug overlays are skipped.
+    Rejected uploads never reached DynamoDB — the gate quarantined them before any record was
+    created — so this tab has no table to read and must list the bucket prefix instead. Each object
+    gets a short-lived pre-signed URL so the private images can be previewed in the page. The
+    listing is paginated to the end, and the prefix placeholder and any debug corner overlays are
+    skipped so only real rejected photos are shown.
 
     Args:
         None. The bucket and prefix come from module-level configuration.
 
     Returns:
-        Tuple of (items, None) on success, where each item is a dict with key, name, url and size;
-        or (None, error_string) on failure.
+        Tuple of (items, None) on success, where each item is a dict with key, name, url and size
+        (in bytes), sorted by name, and an empty list means nothing is quarantined; or
+        (None, error_string) on failure.
     """
     if not IMAGES_BUCKET:
         return None, "IMAGES_BUCKET not configured"
@@ -374,14 +418,12 @@ def _list_rejected():
         items = []
         token = None
 
-        # Page through the whole prefix; a truncated listing would hide uploads
         while True:
             kw = {"Bucket": IMAGES_BUCKET, "Prefix": REJECTED_PREFIX}
             if token:
                 kw["ContinuationToken"] = token
             resp = s3.list_objects_v2(**kw)
             for o in resp.get("Contents", []):
-                # Skip the prefix placeholder and debug overlays — only real photos
                 k = o["Key"]
                 if k.endswith("/") or k.endswith(".keep") or k.endswith("__corners.png"):
                     continue
@@ -389,14 +431,14 @@ def _list_rejected():
                     "key": k,
                     "name": k.split("/")[-1],
                     "url": _rejected_preview_url(k),
-                    "size": o.get("Size", 0),  # bytes (from list_objects_v2)
+                    "size": o.get("Size", 0),
                 })
             if not resp.get("IsTruncated"):
                 break
             token = resp.get("NextContinuationToken")
         items.sort(key=lambda i: i["name"])
         return items, None
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return None, str(e)
 
 
@@ -404,15 +446,17 @@ def _rejected_preview_url(key):
     """
     Builds a short-lived pre-signed URL so a rejected upload can be previewed.
 
-    The bucket is private, so the browser cannot fetch these directly. 
-    A failure returns an empty string and the row simply renders without a thumbnail, 
-    rather than breaking the whole Rejected tab.
+    The bucket is private, so the browser cannot fetch these directly. The URL is valid for
+    REJECTED_URL_TTL seconds (one hour), long enough to look through the tab. Signing is best
+    effort: a failure returns an empty string, and the Rejected tab or the delete confirmation page
+    then shows the upload without its picture rather than failing.
 
     Args:
         key: S3 key of the rejected object.
 
     Returns:
-        The pre-signed GET URL, or an empty string on failure.
+        The pre-signed GET URL, or an empty string when the bucket is not configured or signing
+        failed.
     """
     if not IMAGES_BUCKET:
         return ""
@@ -421,18 +465,25 @@ def _rejected_preview_url(key):
             "get_object", Params={"Bucket": IMAGES_BUCKET, "Key": key},
             ExpiresIn=REJECTED_URL_TTL,
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         return ""
 
 
 def _reprocess_rejected(key):
     """
-    Rescues a wrongly rejected upload by putting it back into the processing path.
+    Rescues a wrongly-rejected upload by putting it back into the processing path.
 
-    This is the only place a human overrules a model. 
-    The image goes back into the raw prefix with a force-process marker, so the gate forwards it 
-    without scoring it again, and the quarantined copy is removed. 
-    The key must be under the quarantine prefix.
+    The object is written back into the raw prefix carrying a force-process marker, and the
+    quarantined copy is then removed. Landing in the raw prefix re-triggers the gate, which sees
+    the marker and forwards straight to the image-processor without scoring the image again — that
+    matters, because an identical image would score identically and be rejected forever otherwise.
+    The result is that a genuine card the gate got wrong finally gets processed and reaches
+    DynamoDB. All existing metadata, the uploader included, is kept so the rescued card keeps its
+    attribution. The bytes are read and PUT rather than copied with copy_object on purpose: the
+    re-submit must rewrite the metadata to add the marker, and copy_object only does that when
+    MetadataDirective="REPLACE" is remembered, while a read and a PUT have no such flag to forget.
+    The key is checked against the quarantine prefix, so this cannot be pointed at arbitrary
+    objects.
 
     Args:
         key: S3 key of the rejected object, which must be under the quarantine prefix.
@@ -446,10 +497,9 @@ def _reprocess_rejected(key):
         return None, "IMAGES_BUCKET not configured"
     raw_key = RAW_PREFIX + key[len(REJECTED_PREFIX):]
     try:
-        # Read and write the bytes rather than copy_object
         obj = s3.get_object(Bucket=IMAGES_BUCKET, Key=key)
         body = obj["Body"].read()
-        md = dict(obj.get("Metadata", {}))  # preserve uploader (+ anything else)
+        md = dict(obj.get("Metadata", {}))
         md[FORCE_PROCESS_META] = "1"
         s3.put_object(
             Bucket=IMAGES_BUCKET,
@@ -460,16 +510,17 @@ def _reprocess_rejected(key):
         )
         s3.delete_object(Bucket=IMAGES_BUCKET, Key=key)
         return raw_key, None
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return None, str(e)
 
 
 def _delete_rejected(key):
     """
-    Dismisses a rejected upload from the quarantine prefix.
+    Dismisses a rejected upload by deleting it from the quarantine prefix.
 
-    The bucket is versioned, so a mistaken dismissal is still recoverable and the key must be
-    under the quarantine prefix, so this cannot reach cards or raw uploads.
+    The bucket is versioned, so this writes a delete marker rather than destroying the object — a
+    mistaken dismissal is still recoverable. The key is checked against the quarantine prefix, so
+    this cannot be used to delete cards or raw uploads.
 
     Args:
         key: S3 key of the rejected object, which must be under the quarantine prefix.
@@ -484,11 +535,10 @@ def _delete_rejected(key):
     try:
         s3.delete_object(Bucket=IMAGES_BUCKET, Key=key)
         return True, None
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return None, str(e)
 
 
-# Admin's html page
 PAGE_CSS = """
 <style>
   body { font-family: -apple-system, system-ui, sans-serif; max-width: 900px;
@@ -502,7 +552,7 @@ PAGE_CSS = """
            vertical-align: top; }
   .status-pending { color: #c60; font-weight: 700; }
   .status-approved { color: #070; font-weight: 700; }
-  /* publishStatus colours: green = on GitHub, red = failed
+  /* publishStatus colours (PROBLEMS.md #3): green = on GitHub, red = failed
      (re-save to retry), orange = in flight. */
   .publish-published { color: #070; font-weight: 700; }
   .publish-failed { color: #c00; font-weight: 700; }
@@ -543,7 +593,9 @@ def esc(x):
     """
     Escapes a value for safe interpolation into HTML.
 
-    Every rendered field goes through here, because they all come from anonymous uploads or a model's draft text.
+    Every card field rendered into a page goes through here. The values originate from public
+    uploads and from a vision model's draft text, so treating them as trusted markup would be a
+    stored cross-site-scripting hole in the admin UI.
 
     Args:
         x: String to escape, or None.
@@ -558,17 +610,26 @@ def render_list(status_filter, saved_id=None, note=None, deleted_id=None):
     """
     Renders the main card list page.
 
-    One row per card, with its status and publish state. 
-    The optional arguments drive the banner, so the result of a save or delete survives the redirect that follows it.
+    Builds one table row per card: its title linking to the edit form, its status, its publish state
+    (so a failed publish is obvious at a glance), event and year, the size of the processed image,
+    the cardId and a Delete button. The size costs one HeadObject per row, which is fine at this
+    catalog's size. The Delete button is a GET form that only opens the confirmation page, where the
+    CSRF-protected POST does the deleting; a JavaScript confirm would not run, because the admin
+    content security policy allows no script.
+    The optional arguments drive the confirmation banner shown after a redirect, so the result of a
+    save or a delete is visible on the page the user lands on rather than being lost in the
+    redirect. A failed delete is reported with the card still listed, so it can be retried.
 
     Args:
         status_filter: Status to filter by, or None for all cards.
-        saved_id: Card just saved, highlighted with a confirmation banner.
-        note: Free-text message to show in the banner.
-        deleted_id: Card just deleted, reported in the banner.
+        saved_id: Card just saved, confirmed in the banner; it takes precedence over deleted_id.
+        note: Tokens separated by ";;" that fill the banner: "pub:<commit url>" and
+            "gh_err:<message>" after a save, "del_err:<message>" after a failed delete. Other tokens
+            are ignored.
+        deleted_id: Card just deleted, or whose delete failed, reported in the banner.
 
     Returns:
-        Complete HTML document as a string.
+        Complete HTML document as a string; a table row saying "No cards." when nothing matches.
     """
     rows = []
     items = list_cards(status_filter)
@@ -576,15 +637,11 @@ def render_list(status_filter, saved_id=None, note=None, deleted_id=None):
         cid = _s(it, "cardId")
         st = _s(it, "status")
         st_cls = "status-pending" if st == "pending" else "status-approved" if st == "approved" else ""
-
-        # Shows whether an approved card actually reached GitHub
         ps = _s(it, "publishStatus")
         ps_cls = ("publish-published" if ps == "published"
                   else "publish-failed" if ps == "failed"
                   else "publish-pending" if ps == "pending" else "")
         title = _s(it, "title") or _s(it, "title_ai_draft") or "(untitled)"
-
-        # A GET to the confirm page
         del_btn = (
             f"<form class='del-form' method='get' action='{BASE}/delete'>"
             f"<input type='hidden' name='cardId' value='{esc(cid)}'>"
@@ -596,8 +653,6 @@ def render_list(status_filter, saved_id=None, note=None, deleted_id=None):
             f"<td class='{st_cls}'>{esc(st)}</td>"
             f"<td class='{ps_cls}'>{esc(ps or '—')}</td>"
             f"<td class='meta'>{esc(_s(it, 'event'))} {esc(_s(it, 'year'))}</td>"
-
-            # One HeadObject per row, which is fine at this size
             f"<td class='meta'>{esc(_finished_size_mb(it))}</td>"
             f"<td class='meta'>{esc(cid)}</td>"
             f"<td>{del_btn}</td>"
@@ -618,8 +673,6 @@ def render_list(status_filter, saved_id=None, note=None, deleted_id=None):
         extra = (" &middot; " + " &middot; ".join(parts)) if parts else ""
         banner = f"<div class='saved'>Saved {esc(saved_id)}.{extra}</div>"
     elif deleted_id:
-        
-        # The delete flow reuses the note channel with a single del_err token
         err = ""
         for t in (note.split(";;") if note else []):
             if t.startswith("del_err:"):
@@ -649,8 +702,14 @@ def render_edit(card_id):
     """
     Renders the single-card edit form.
 
-    Shows the finished image next to every editable field, pre-filled from the model's drafts.
-    Setting the status to approved is what arms publishing on the next save.
+    Shows the card's keys, its processed image and every field in EDITABLE: the status as radio
+    buttons, the MULTILINE fields as text areas and the rest as text inputs. A field that is still
+    empty is pre-filled with its AI draft (the DRAFTS fields), because the drafts are usually right
+    and only need a tweak; the draft also stays visible, read-only, below the field as a reference.
+    Once a publish has been attempted, the page shows its state, and after a failure the error with
+    the hint that re-saving with status approved retries it. The form carries a per-card CSRF token,
+    and the approve control is what arms publishing on save. The Delete button is a separate GET
+    form outside the save form, so it never submits the edits.
 
     Args:
         card_id: Identifier of the card to edit.
@@ -667,8 +726,6 @@ def render_edit(card_id):
         val = _s(item, field)
         draft_field = DRAFTS.get(field)
         dval = _s(item, draft_field) if draft_field else ""
-        
-        # Prefill with the draft when nothing is approved yet
         if not val and dval:
             val = dval
         label = field.capitalize()
@@ -698,7 +755,6 @@ def render_edit(card_id):
         f"created: {esc(_s(item, 'createdAt'))} &middot; updated: {esc(_s(item, 'updatedAt'))}</div>"
     )
 
-    # Shown once a publish has been attempted
     ps = _s(item, "publishStatus")
     if ps:
         ps_cls = ("publish-published" if ps == "published"
@@ -742,8 +798,6 @@ def render_edit(card_id):
         f"{''.join(fields_html)}"
         f"<br><button type='submit'>Save to DynamoDB</button>"
         f"</form>"
-        
-        # Kill switch on the edit page
         f"<form class='del-form' method='get' action='{BASE}/delete' style='display:block; margin-top:10px;'>"
         f"<input type='hidden' name='cardId' value='{esc(card_id)}'>"
         f"<button class='del-btn del-btn-lg' type='submit'>Delete this card…</button>"
@@ -753,15 +807,19 @@ def render_edit(card_id):
 
 
 def render_delete_confirm(card_id):
-    """CSP-safe confirmation page for the kill switch.
-    Shows what will be removed and a CSRF-protected POST form that actually performs the delete. 
-    Reached by the GET Delete buttons.
+    """
+    Renders the confirmation page of the card kill switch, reached by the GET Delete buttons.
+
+    The page names the DynamoDB item and the S3 images the committer will remove, names the card's
+    GitHub files too when its publishStatus is "published", and holds the CSRF-protected POST form
+    that performs the delete. It is a page rather than a JavaScript confirm because the admin
+    content security policy allows no script.
 
     Args:
         card_id: Identifier of the card queued for deletion.
 
     Returns:
-        Complete HTML document as a string.
+        Complete HTML document as a string, or a short "card not found" page if the id is unknown.
     """
     item = get_card(card_id)
     if not item:
@@ -774,7 +832,6 @@ def render_delete_confirm(card_id):
     raw_key = _s(item, "rawKey")
     finished_key = _s(item, "finishedKey")
 
-    # Shows exactly what the deleter will remove for specific card
     gh_line = (
         f"<li>GitHub: <code>{esc(slug)}.md</code> + <code>{esc(card_id)}.png</code> "
         f"on the live branch (the card is <b>published</b> — this takes it OFF the site)</li>"
@@ -817,8 +874,9 @@ def _filter_bar(active):
     """
     Builds the status tab bar shared by the card list and the Rejected view.
 
-    Both views render the same bar, so the tabs stay identical even though 
-    one is backed by DynamoDB and the other by an S3 listing.
+    Both views render this same bar so the tabs stay identical, even though one is backed by
+    DynamoDB and the other by an S3 listing — the user should not be able to tell that the Rejected
+    tab comes from somewhere else entirely.
 
     Args:
         active: The currently selected filter — "pending", "approved", "rejected" or None for all.
@@ -848,23 +906,27 @@ def _filter_bar(active):
 
 def render_rejected(note=None, reprocessed=None, deleted=None):
     """
-    Renders the Rejected tab: the quarantined photos, with no card details to show.
+    Renders the Rejected tab: one tile per quarantined upload, read straight from S3.
 
-    Each one gets two buttons. "Put to process" sends it back through the pipeline, 
-    where it reappears as a pending card. 
-    "Delete" goes via a confirm page, like the card kill switch.
+    A rejected upload has no DynamoDB item, so there are no card details to show, only the picture,
+    its file name and size, and two buttons. "Put to process" is a one-click POST, because it moves
+    the upload rather than destroying it: the upload goes back into the processing path and
+    reappears as a pending card, which is the first time it enters DynamoDB. "Delete" opens a
+    confirmation page first, like the card kill switch. The optional arguments come from the
+    redirect after either action and fill the result banner.
 
     Args:
-        note: Optional message to show in the result banner.
+        note: Tokens separated by ";;": "reproc_err:<message>" or "reject_del_err:<message>" after a
+            failed action. Other tokens are ignored.
         reprocessed: Key of the upload just sent back for processing, if any.
         deleted: Key of the upload just deleted, if any.
 
     Returns:
-        Complete HTML document as a string.
+        Complete HTML document as a string; it says "No rejected uploads." when the prefix is empty,
+        or shows the error when the listing failed.
     """
     items, err = _list_rejected()
 
-    # Result banner
     banner = ""
     if reprocessed:
         banner = (
@@ -892,8 +954,8 @@ def render_rejected(note=None, reprocessed=None, deleted=None):
                 key = it.get("key", "")
                 name = it.get("name", key)
                 url = it.get("url", "")
-                size_mb = f"{it.get('size', 0) / 1048576:.2f} MB"  # bytes -> MB
-                csrf = _csrf_token(key)  # CSRF id for a rejected object = its S3 key
+                size_mb = f"{it.get('size', 0) / 1048576:.2f} MB"
+                csrf = _csrf_token(key)
                 img = (
                     f"<img src='{esc(url)}' alt='{esc(name)}' style='width:100%;height:200px;"
                     f"object-fit:contain;border-radius:8px;background:#f6f6f6;'>"
@@ -934,14 +996,19 @@ def render_rejected(note=None, reprocessed=None, deleted=None):
 
 
 def render_reject_delete_confirm(key):
-    """Confirm page for deleting a rejected upload. 
-    Shows the picture + a CSRF-protected POST.
+    """
+    Renders the confirmation page for deleting a rejected upload.
+
+    Like the card kill switch, it is a page rather than a JavaScript confirm, because the admin
+    content security policy allows no script. It shows the picture, its key and the
+    CSRF-protected POST form that performs the delete.
 
     Args:
         key: S3 key of the rejected upload queued for deletion.
 
     Returns:
-        Complete HTML document as a string.
+        Complete HTML document as a string, or a short "Invalid key." page when the key is empty or
+        outside the quarantine prefix.
     """
     if not key or not key.startswith(REJECTED_PREFIX):
         return (
@@ -976,6 +1043,15 @@ def _html_resp(body, code=200):
     """
     Wraps an HTML body in a response carrying the admin security headers.
 
+    Every HTML page this Lambda returns past the auth check goes through here (the 401 and 503
+    responses of the auth check do not), so the whole header set is defined in one place and
+    cannot drift between routes. Caching is disabled because these pages show
+    pending review data; framing is denied because a page with an Approve button is a real
+    clickjacking target; the referrer is suppressed so the admin URL and cardId do not leak to
+    outbound card links; and the content security policy is tight enough to block script entirely,
+    which it can afford to be because the UI uses no JavaScript at all — only an inline style
+    block, same-origin forms and pre-signed S3 images.
+
     Args:
         body: Complete HTML document as a string.
         code: HTTP status code.
@@ -987,14 +1063,10 @@ def _html_resp(body, code=200):
         "statusCode": code,
         "headers": {
             "Content-Type": "text/html; charset=utf-8",
-            
-            # Admin pages show pending data
             "Cache-Control": "no-store",
             "Pragma": "no-cache",
             "X-Content-Type-Options": "nosniff",
             "X-Frame-Options": "DENY",
-            
-            # Keeps the admin URL and cardId out of the Referer on outbound links
             "Referrer-Policy": "no-referrer",
             "Content-Security-Policy": (
                 "default-src 'none'; img-src https://*.amazonaws.com; "
@@ -1010,9 +1082,9 @@ def _redirect(location, code=303):
     """
     Builds a redirect response, used after every state-changing POST.
 
-    Redirecting after a write is what stops a browser refresh from re-submitting the form 
-    and repeating the action - the post/redirect/get pattern. 
-    The default 303 makes the follow-up request a GET regardless of the original method.
+    Redirecting after a write is what stops a browser refresh from re-submitting the form and
+    repeating the action — the post/redirect/get pattern. The default 303 makes the follow-up
+    request a GET regardless of the original method.
 
     Args:
         location: URL to redirect to.
@@ -1036,8 +1108,8 @@ def _read_body(event):
     """
     Extracts the request body from an API Gateway event, decoding it if needed.
 
-    API Gateway may deliver the body base64-encoded depending on the content type, so the flag has to be 
-    honoured rather than assumed - reading it raw would corrupt form submissions.
+    API Gateway may deliver the body base64-encoded depending on the content type, so the flag has
+    to be honoured rather than assumed — reading it raw would corrupt form submissions.
 
     Args:
         event: API Gateway HTTP API payload v2.0 event.
@@ -1053,7 +1125,19 @@ def _read_body(event):
 
 def _get_credentials():
     """
-    Fetches the Basic Auth credentials from Secrets Manager, cached for a bounded time.
+    Fetches the Basic Auth credentials from Secrets Manager, with a bounded cache.
+
+    The credentials are cached per warm container (in _credentials, with the time.monotonic() of the
+    last successful fetch in _credentials_fetched_at) for CREDS_TTL_SECONDS, five minutes, rather
+    than for the container's whole life. That bounds how long a rotated secret keeps being honoured
+    — an unbounded cache would let a revoked password work until the container happened to recycle
+    — while the extra GetSecretValue, once per TTL per warm container, is negligible at this
+    traffic.
+    The failure behaviour is deliberately asymmetric. On a cold cache a fetch failure propagates,
+    so the caller denies access and the endpoint fails CLOSED: an unreadable secret must never mean
+    "let everyone in". On a refresh failure, where valid credentials are already cached, those are
+    kept and the fetch is retried next time, so a transient Secrets Manager blip does not knock out
+    a working admin session.
 
     Args:
         None. The secret ARN comes from module-level configuration.
@@ -1076,13 +1160,16 @@ def _get_credentials():
         return _credentials
     except Exception:
         if _credentials is not None:
-            return _credentials  # transient refresh failure -> keep valid cached creds
-        raise  # cold cache + fetch failed -> fail closed (caller returns 503)
+            return _credentials
+        raise
 
 
 def _unauthorized():
     """
     Builds the 401 response that triggers the browser's native login prompt.
+
+    The WWW-Authenticate header is what makes the browser show its own credential dialog, so the
+    admin UI needs no login page of its own.
 
     Args:
         None.
@@ -1102,7 +1189,13 @@ def _unauthorized():
 
 def _authorize(event):
     """
-    Checks a request's Basic Auth credentials, gating every route.
+    Checks a request's Basic Auth credentials, gating every route in this Lambda.
+
+    Both the username and the password are compared with hmac.compare_digest rather than ==, so
+    neither can be recovered by measuring how long the comparison takes. Every failure path denies:
+    an unreadable secret, a missing or malformed Authorization header, bad base64, or a mismatch —
+    this fails CLOSED by construction, with the only successful return being an explicit match on
+    both fields.
 
     Args:
         event: API Gateway HTTP API payload v2.0 event, read for its authorization header.
@@ -1113,7 +1206,7 @@ def _authorize(event):
     """
     try:
         creds = _get_credentials()
-    except Exception as e:  # secret missing / malformed / no permission -> deny
+    except Exception as e:
         print(f"[review-editor] basic-auth secret unavailable: {e}")
         return {
             "statusCode": 503,
@@ -1137,13 +1230,23 @@ def _authorize(event):
 
 def _csrf_token(card_id):
     """
-    Builds a per-card CSRF token - a keyed hash of the card id, using the auth password as the key.
+    Derives a per-card CSRF token by HMAC-ing the card id with the auth password.
+
+    This is stateless by design — there is no session store, and the token can be recomputed on
+    demand from something only the server knows. It closes a real hole: browsers cache Basic Auth
+    credentials and attach them automatically, so without a token any site could POST to the save
+    or delete routes and have it succeed. An attacker cannot forge the token, because they do not
+    have the password, and cannot read it, because the edit page is opaque to them cross-origin.
+    Binding it to the card id means a token captured for one card is useless against another.
 
     Args:
         card_id: The card the token is bound to; also used for rejected-upload keys.
 
     Returns:
         The token as a hex-encoded HMAC-SHA256 digest.
+
+    Raises:
+        Exception: If the credentials cannot be fetched (passed on from _get_credentials()).
     """
     key = _get_credentials()["password"].encode("utf-8")
     return hmac.new(key, card_id.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -1153,7 +1256,9 @@ def _csrf_ok(card_id, token):
     """
     Verifies a submitted CSRF token against the expected one for a card.
 
-    Any failure, including being unable to compute the expected token, counts as a rejection.
+    The comparison is constant time, and any failure to even compute the expected token — for
+    instance if the credentials are unavailable — is treated as a rejection rather than an error,
+    so this fails closed.
 
     Args:
         card_id: The card the token should be bound to.
@@ -1168,14 +1273,32 @@ def _csrf_ok(card_id, token):
         return False
 
 
-# Input validation
-SLUG_MAX_LEN = 100  # <slug>.md has to stay a valid filename
+SLUG_MAX_LEN = 100
 SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 
 
 def _validate(values):
     """
-    Returns an error string if the submitted values are invalid, else "".
+    Checks the submitted form values and reports the first problem.
+
+    The form constrains these in the UI, but a crafted POST need not, so every field is re-checked
+    here — the slug most of all. The slug is a path component, not free text: the committer puts
+    it straight into the GitHub commit path (<content dir>/<slug>.md), and it becomes the public
+    URL segment (/collectibles/<slug>/). A slug holding "/" or ".." would commit a file outside the
+    content directory on the live branch that Amplify builds, which is build-time code execution.
+    It is checked here although the route is already behind Basic Auth and CSRF, so that one leaked
+    credential or one careless paste cannot reach amplify.yml. URL quoting is no protection, because
+    urllib.parse.quote() leaves "/" and ".." as they are.
+
+    SLUG_RE accepts exactly what the image-processor's slugify() produces: lowercase alphanumeric
+    groups joined by single hyphens, a form that cannot hold "/", "\\", "..", a leading dot,
+    whitespace or control characters. It is applied with fullmatch(), not with match() and "^...$",
+    because "$" also matches just before a trailing newline, so "aws-card\\n" would pass.
+    SLUG_MAX_LEN keeps <slug>.md a valid file name (file systems cap a name at 255 bytes). The
+    checks run on the slug with surrounding whitespace stripped. The format is checked whenever
+    that slug is non-empty, not only on approve, so a pending card cannot store a slug holding "/"
+    or ".." either: the committer's delete path builds GitHub paths from the stored slug whatever
+    the card's status.
 
     Args:
         values: Mapping of submitted field names to their string values.
@@ -1191,8 +1314,6 @@ def _validate(values):
         v = (values.get(numfield, "") or "").strip()
         if v and not v.isdigit():
             return f"{numfield} must be a whole number (or empty)."
-        
-    # Checked whenever the slug is non-empty
     slug = (values.get("slug", "") or "").strip()
     if slug and (len(slug) > SLUG_MAX_LEN or not SLUG_RE.fullmatch(slug)):
         return (
@@ -1210,25 +1331,34 @@ def _validate(values):
 
 def handle_save(event):
     """
-    Handles the edit form post: validates, saves, and publishes when the card is approved.
+    Handles the edit form POST: validates, saves, and publishes when approved.
 
     This is the human approval gate, and the only route that can put a card on the public site.
+    Nothing is written without a valid CSRF token and values that pass _validate(). Every save
+    while the status is approved republishes, so editing a published card (fixing a typo, say)
+    overwrites its files on the live branch: the markdown is keyed by the slug and the image by the
+    stable cardId, so the same card lands on the same paths. A changed slug leaves the old
+    <slug>.md behind. The same rule covers the first approval and a retry after a failed publish.
+    The publish state is set to pending before the committer is invoked, so a crash before the
+    result shows as pending instead of silently keeping the old state, and the outcome is recorded
+    either way, so a failure is visible and retryable rather than leaving the card silently
+    approved-but-unpublished.
+    Returns a redirect rather than a page, so refreshing the browser cannot re-submit the form.
 
     Args:
         event: API Gateway event carrying the URL-encoded form body.
 
     Returns:
-        A redirect response back to the list on success, or an HTML error response on a rejected
-        CSRF token, a missing cardId or a validation failure.
+        A redirect response back to the list, carrying the publish result as notes, on success; or
+        an HTML error response on a missing cardId (400), a rejected CSRF token (403), a validation
+        failure (400) or an unknown card (404).
     """
 
-    # Parse the form and keep blank values so cleared fields are saved as empty
     form = urllib.parse.parse_qs(_read_body(event), keep_blank_values=True)
     card_id = form.get("cardId", [""])[0]
     if not card_id:
         return _html_resp("<p>Missing cardId</p>", 400)
 
-    # Require the signed token the edit form embedded
     if not _csrf_ok(card_id, form.get("csrf", [""])[0]):
         return _html_resp(
             f"<p>Invalid or missing CSRF token. Reload the edit page and try again.</p>"
@@ -1238,7 +1368,6 @@ def handle_save(event):
 
     values = {f: form.get(f, [""])[0] for f in EDITABLE}
 
-    # Validate before touching the DB
     problem = _validate(values)
     if problem:
         return _html_resp(
@@ -1279,20 +1408,25 @@ def handle_save(event):
 
 def handle_delete(event):
     """
-    The kill switch: asks the committer to remove the card from GitHub, S3 and DynamoDB.
+    Handles the kill switch POST: has the committer remove a card everywhere.
+
+    The CSRF token comes from the confirmation page, which only an authenticated user can load, so
+    a cross-site POST riding on cached Basic Auth credentials cannot forge it. The committer removes
+    the published GitHub files first and stops if that fails, then the S3 objects, and the DynamoDB
+    item last, so a failed delete normally leaves the card in the list to retry.
 
     Args:
         event: API Gateway event carrying the form body with cardId and CSRF token.
 
     Returns:
-        A redirect back to the list, or an HTML error response if the CSRF check failed.
+        A redirect back to the list, with a del_err note when the committer reported an error; or an
+        HTML error response on a missing cardId (400) or a rejected CSRF token (403).
     """
     form = urllib.parse.parse_qs(_read_body(event), keep_blank_values=True)
     card_id = form.get("cardId", [""])[0]
     if not card_id:
         return _html_resp("<p>Missing cardId</p>", 400)
 
-    # The token only exists on the confirm page
     if not _csrf_ok(card_id, form.get("csrf", [""])[0]):
         return _html_resp(
             f"<p>Invalid or missing CSRF token. Reload the delete page and try again.</p>"
@@ -1309,23 +1443,23 @@ def handle_delete(event):
 
 def handle_reprocess(event):
     """
-    Handles "put to process": sends a rejected upload back through the pipeline.
+    Handles the "Put to process" POST of the Rejected tab.
 
-    Nothing is destroyed, so this needs no confirm page. 
-    The image reappears as a pending card once the processor finishes.
+    _reprocess_rejected() moves the upload back into the raw prefix with the force-process marker,
+    so it flows through the normal pipeline and finally lands in DynamoDB. A rejected upload has no
+    cardId yet, so its CSRF token is bound to its S3 key.
 
     Args:
         event: API Gateway event carrying the form body with the S3 key and CSRF token.
 
     Returns:
-        A redirect back to the Rejected tab, or an HTML error response if the CSRF check failed.
+        A redirect back to the Rejected tab with a result banner; or an HTML error response on a
+        missing key (400) or a rejected CSRF token (403).
     """
     form = urllib.parse.parse_qs(_read_body(event), keep_blank_values=True)
     key = form.get("key", [""])[0]
     if not key:
         return _html_resp("<p>Missing key</p>", 400)
-    
-    # A rejected object has no cardId yet, so the token is bound to its S3 key instead
     if not _csrf_ok(key, form.get("csrf", [""])[0]):
         return _html_resp(
             f"<p>Invalid or missing CSRF token. Reload the rejected page and try again.</p>"
@@ -1342,15 +1476,17 @@ def handle_reprocess(event):
 
 def handle_reject_delete(event):
     """
-    Deletes a rejected upload from the quarantine prefix.
+    Handles the delete POST of the Rejected tab.
 
-    The bucket is versioned, so this leaves a recoverable version behind the delete marker.
+    _delete_rejected() deletes the object from the quarantine prefix, a soft delete on the
+    versioned bucket. As for reprocessing, the CSRF token is bound to the S3 key.
 
     Args:
         event: API Gateway event carrying the form body with the S3 key and CSRF token.
 
     Returns:
-        A redirect back to the Rejected tab, or an HTML error response if the CSRF check failed.
+        A redirect back to the Rejected tab with a result banner; or an HTML error response on a
+        missing key (400) or a rejected CSRF token (403).
     """
     form = urllib.parse.parse_qs(_read_body(event), keep_blank_values=True)
     key = form.get("key", [""])[0]
@@ -1372,25 +1508,29 @@ def handle_reject_delete(event):
 
 def handler(event, context):
     """
-    Lambda entry point: authorises the request, then routes it to a view or an action.
+    Lambda entry point: authenticates the request, then routes it to a view or an action.
 
-    Authorisation runs before any routing, so no route can be reached unauthenticated. 
-    GETs render pages, POSTs change state and each verifies its own CSRF token.
+    Authorization runs before any routing at all, so every page and every action is gated by the
+    same check and no route can be reached unauthenticated — the public upload endpoint is a
+    separate Lambda and is unaffected. After that the request is dispatched by method and path:
+    GETs render the list, the edit form, the rejected tab or a confirmation page, while POSTs run
+    the state-changing actions, each of which verifies its own CSRF token. A favicon request gets
+    an empty 204, and any other method and path a 404 page. An exception from AWS or the code is
+    shown in the browser as a 500 page with its message, so the maintainer sees what failed.
 
     Args:
         event: API Gateway HTTP API payload v2.0 event.
         context: Lambda context object, unused.
 
     Returns:
-        An API Gateway response dict — an HTML page, a redirect, or an auth challenge.
+        An API Gateway response dict: an HTML page, a redirect, an empty 204 for the favicon, or
+        the 401 or 503 response of the auth check.
     """
 
-    # Gate everything, before any routing happens
     denied = _authorize(event)
     if denied is not None:
         return denied
 
-    # Route on method and path - unknown paths fall through to the list view
     rc = event.get("requestContext", {}).get("http", {})
     method = rc.get("method", "GET")
     path = rc.get("path") or event.get("rawPath") or BASE
@@ -1398,8 +1538,6 @@ def handler(event, context):
 
     try:
         if method == "GET" and path in (BASE, BASE + "/"):
-            
-            # The Rejected tab has no database to read, so it renders separately
             if qs.get("status") == "rejected":
                 return _html_resp(render_rejected(
                     note=qs.get("note"),
@@ -1414,8 +1552,6 @@ def handler(event, context):
             return _html_resp(render_edit(qs.get("cardId", "")))
         if method == "POST" and path == BASE + "/save":
             return handle_save(event)
-        
-        # Kill switch: the GET shows a confirm page, the POST does the deleting
         if method == "GET" and path == BASE + "/delete":
             return _html_resp(render_delete_confirm(qs.get("cardId", "")))
         if method == "POST" and path == BASE + "/delete":

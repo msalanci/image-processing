@@ -1,9 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Michal Salanci
-
-**/__pycache__/
-*.pyc
-.venv/
-input/
-output/
-*.md
+#
+# Build context for the image-processor image: only the files the Dockerfile copies.
+*
+!requirements.txt
+!app.py

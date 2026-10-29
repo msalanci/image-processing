@@ -1,31 +1,35 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Michal Salanci
+"""Image-processor Lambda: turns a raw card photo into a straightened card and a pending review record.
 
-"""Turns a crooked photo of an AWS Builder Card into a clean, straight image.
+card-detect invokes this function asynchronously with an S3 event for each upload under images/raw/
+that may be a card. The handler cuts the card out of the photo with rembg (a BiRefNet model on
+onnxruntime, CPU), straightens it with OpenCV, writes it to images/finished/<cardId>.png and keeps a
+corners overlay next to the original. A Bedrock vision model drafts the card's title, effect and
+description, which are stored in DynamoDB as a pending item for the maintainer's review, and an SNS
+email announces the new card.
 
-The card-detect gate invokes this lambda with the S3 event for a new upload. 
-A segmentation model marks which pixels are the card, OpenCV finds its four corners and straightens it and the background is cut away. 
-The finished image then goes to a Bedrock vision model, which drafts the card's text into DynamoDB, and an email says the card is ready to review.
+The rembg model is loaded once per container, at import, and reused by warm invocations; the
+Dockerfile bakes it into the image under U2NET_HOME, so a cold start downloads nothing. HEIC and HEIF
+photos, the iPhone default, decode through Pillow with the pillow-heif opener registered at import;
+its wheel bundles libheif, so the image needs no OS package for it. Without pillow-heif a warning is
+logged and the other formats still work.
 
-Nothing here is published: every field is written as a draft, and the approved fields are left empty for a human to fill in.
-
-Functions:
-    handler: Entry point; processes each uploaded image in the S3 event.
-    process_image: Runs the whole cleanup and returns the finished PNG.
-    extract_card_fields: Reads the card's text with a Bedrock vision model.
-
-Environment (set by Terraform):
-    REMBG_MODEL             segmentation model name (weights are baked into the image)
-    MAX_DIM                 longest side allowed before the photo is downscaled
-    BACKGROUND              fill behind the card: black, white or none
-    RAW_PREFIX              prefix uploads arrive under
-    FINISHED_PREFIX         prefix the cleaned images are written to
-    DDB_TABLE               card table the draft record is written to
-    BEDROCK_MODEL_ID        vision model that reads the card
-    BEDROCK_REGION          region the Bedrock call goes to
-    SNS_TOPIC_ARN           topic for the "go review it" email
-    REVIEW_URL              link to the review editor, included in that email
-    AWS_REGION              provided automatically by the Lambda runtime
+Environment variables:
+    REMBG_MODEL: The rembg model (default "birefnet-general-lite", which needs less memory and runs
+        faster than "birefnet-general"). The Dockerfile sets it to the model it bakes in.
+    MAX_DIM: The longest side, in pixels, that a photo is downscaled to before processing (default
+        2048). Smaller photos are never upscaled; BiRefNet segments at 1024 pixels internally anyway.
+    BACKGROUND: The fill around the card: "black" (default), "white", or "none" for transparency.
+    RAW_PREFIX: The key prefix of uploads (default "images/raw/"); other keys are skipped.
+    FINISHED_PREFIX: The key prefix of cleaned card images (default "images/finished/").
+    DDB_TABLE: The DynamoDB table of cards (default "BuilderCards").
+    BEDROCK_MODEL_ID: The Bedrock vision model that drafts the text (no default).
+    BEDROCK_REGION: The region of the Bedrock client (default "eu-central-1").
+    SNS_TOPIC_ARN: The topic of the "new card uploaded" email; empty skips the email.
+    STATIC_CARDS_DIR, RAW_DOWNLOAD_DIR, CORNERS_DOWNLOAD_DIR: The local folders named in the email's
+        download commands.
+    REVIEW_URL: The review-editor link in the email.
 """
 
 import os
@@ -45,19 +49,16 @@ from PIL import Image
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# HEIC/HEIF decoding for Pillow
 try:
     from pillow_heif import register_heif_opener
 
     register_heif_opener()
-except Exception as _heif_err:
+except Exception as _heif_err:  # pragma: no cover
     logger.warning("pillow-heif unavailable; HEIC/HEIF uploads will not decode: %s", _heif_err)
 
 MODEL = os.environ.get("REMBG_MODEL", "birefnet-general-lite")
-
-# Photos longer than this are downscaled to bound memory; smaller ones are left alone
 MAX_DIM = int(os.environ.get("MAX_DIM", "2048"))
-BACKGROUND = os.environ.get("BACKGROUND", "black").lower()  # black, white or none
+BACKGROUND = os.environ.get("BACKGROUND", "black").lower()
 RAW_PREFIX = os.environ.get("RAW_PREFIX", "images/raw/")
 FINISHED_PREFIX = os.environ.get("FINISHED_PREFIX", "images/finished/")
 
@@ -65,7 +66,6 @@ DDB_TABLE = os.environ.get("DDB_TABLE", "BuilderCards")
 BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID")
 BEDROCK_REGION = os.environ.get("BEDROCK_REGION", "eu-central-1")
 
-# Topic for the "new card uploaded, go review it" email
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
 STATIC_CARDS_DIR = os.environ.get("STATIC_CARDS_DIR", "web/awsbuildercards/static/cards")
 RAW_DOWNLOAD_DIR = os.environ.get("RAW_DOWNLOAD_DIR", "card_pictures/RAW")
@@ -77,38 +77,31 @@ ddb = boto3.client("dynamodb")
 bedrock = boto3.client("bedrock-runtime", region_name=BEDROCK_REGION)
 sns = boto3.client("sns")
 
-# Loaded once per container from weights baked into the image, then reused while it stays warm
 SESSION = new_session(MODEL)
 
 
 def get_mask(raw_bytes, session):
-    """
-    Marks which pixels are the card and returns them as a black and white stencil.
+    """Segment the card in a photo and return a binary mask of it.
 
-    The segmentation model scores every pixel, the score is cut into card or background at the midpoint, 
-    then holes and specks are cleaned up and only the largest blob is kept.
+    The mask holds only the largest foreground region, with small holes and specks removed.
 
     Args:
-        raw_bytes: Encoded input image.
-        session: Initialized rembg/BiRefNet inference session.
+        raw_bytes: The encoded photo, at the size the rest of the pipeline works on.
+        session: The rembg session from new_session(), which holds the loaded segmentation model.
 
     Returns:
-        Binary uint8 mask with foreground pixels equal to 255 and background pixels equal to 0.
+        A uint8 mask the size of the photo: 255 on the card, 0 elsewhere. It is all zeros when no
+        foreground is found.
     """
-
-    # BiRefNet segmentation
     cutout = Image.open(io.BytesIO(remove(raw_bytes, session=session))).convert("RGBA")
-    
-    # Extract foreground mask
+
     alpha = np.array(cutout)[:, :, 3]
     _, mask = cv2.threshold(alpha, 127, 255, cv2.THRESH_BINARY)
-    
-    # Remove holes and noise
+
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
-    
-    # Keep only the largest connected component
+
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
     if n > 1:
         largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
@@ -117,39 +110,30 @@ def get_mask(raw_bytes, session):
 
 
 def _rotate_pts(pts, M):
-    """
-    Applies a 2D affine transformation to a set of points.
+    """Apply a 2x3 affine transform to a set of points.
 
     Args:
-        pts: Array of 2D points with shape (N, 2).
-        M: 2×3 affine transformation matrix.
+        pts: An (N, 2) array of x, y points.
+        M: A 2x3 affine matrix, such as one from cv2.getRotationMatrix2D or cv2.invertAffineTransform.
 
     Returns:
-        Transformed points as an array of shape (N, 2).
+        An (N, 2) float array of the transformed points.
     """
-
-    # Convert points to homogeneous coordinates
     ones = np.ones((len(pts), 1), dtype=np.float32)
     h = np.hstack([pts.astype(np.float32), ones])
 
-    # Apply the affine transformation
     return (M @ h.T).T
 
 
 def _fit_line(pts):
-    """
-    Fits a straight line through a set of 2D points.
-
-    The line comes back as a point on it plus a direction vector.
+    """Fit a straight line through a set of points by least squares.
 
     Args:
-        pts: Array of 2D points.
+        pts: An (N, 2) array of x, y points along one edge of the card.
 
     Returns:
-        Tuple (x0, y0, vx, vy), where (x0, y0) is a point on the fitted line and (vx, vy) is the line's direction vector.
+        (x0, y0, vx, vy) as floats: a point on the line and the line's unit direction vector.
     """
-
-    # Fit a line through the supplied points
     vx, vy, x0, y0 = cv2.fitLine(
         pts.astype(np.float32),
         cv2.DIST_L2,
@@ -162,83 +146,70 @@ def _fit_line(pts):
 
 
 def _intersect(l1, l2):
-    """
-    Finds where two lines cross.
-
-    Parallel lines never cross, so those give None.
+    """Intersect two lines given as a point and a direction.
 
     Args:
-        l1: First line represented as (x0, y0, vx, vy).
-        l2: Second line represented as (x0, y0, vx, vy).
+        l1: The first line as (x0, y0, vx, vy), as _fit_line returns it.
+        l2: The second line, in the same form.
 
     Returns:
-        Intersection point as a NumPy array of shape (2,), or None if the lines do not intersect uniquely.
+        The intersection as a float32 array of shape (2,), or None when the lines are exactly
+        parallel. Nearly parallel lines still give a point, possibly far outside the image.
     """
-
-    # Unpack line parameters
     x1, y1, vx1, vy1 = l1
     x2, y2, vx2, vy2 = l2
 
-    # Construct the linear system describing the intersection
     A = np.array([[vx1, -vx2], [vy1, -vy2]], dtype=np.float64)
     b = np.array([x2 - x1, y2 - y1], dtype=np.float64)
 
-    # Solve for the intersection parameters
     try:
         t, _ = np.linalg.solve(A, b)
     except np.linalg.LinAlgError:
         return None
 
-    # Compute the intersection point
     return np.array([x1 + t * vx1, y1 + t * vy1], dtype=np.float32)
 
 
 def find_quad(mask):
-    """
-    Finds the four corners of the card in the stencil.
+    """Find the four corners of the card in its mask.
 
-    Builder Cards have rounded corners, so the corners are where straight lines fitted along the four edges cross, 
-    which lands slightly outside the card itself. 
-    If that fails it falls back to polygon approximation, and then to the smallest rectangle around the card.
+    The corners are where straight lines fitted to the card's four edges meet, so rounded card corners
+    still give sharp ones. Each line is fitted to the middle of its edge only, leaving out 18 % of the
+    side at each end, where the corner bends away, and needs at least 15 points. When that fails, a
+    convex four-point polygon approximation of the largest contour is used, and as a last resort the
+    minimum-area rectangle around it.
 
     Args:
-        mask: Binary foreground mask of the card.
+        mask: The card's binary mask, from get_mask.
 
     Returns:
-        A (4, 2) array containing the detected corner coordinates, or None if no contour is found.
+        A float32 (4, 2) array of corner points in the mask's pixel coordinates, in no fixed order, or
+        None when the mask has no contour.
     """
-
-    # Find all external contours in the binary mask
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not contours:
         return None
 
-    # Select the largest contour, assumed to be the card
     c = max(contours, key=cv2.contourArea)
     pts = c.reshape(-1, 2).astype(np.float32)
 
-    # Rotate the contour so the card becomes approximately axis-aligned
     (cx, cy), (rw, rh), ang = cv2.minAreaRect(c)
     M = cv2.getRotationMatrix2D((cx, cy), ang, 1.0)
     P = _rotate_pts(pts, M)
 
-    # Compute the bounding box of the rotated contour
     minx, maxx = P[:, 0].min(), P[:, 0].max()
     miny, maxy = P[:, 1].min(), P[:, 1].max()
     W, H = maxx - minx, maxy - miny
     bx, by = 0.18 * W, 0.18 * H
 
-    # Define inner margins used for selecting edge points
     cxlo, cxhi = minx + bx, maxx - bx
     cylo, cyhi = miny + by, maxy - by
 
-    # Split contour points into the four card edges
     top    = P[(P[:, 1] < miny + by) & (P[:, 0] > cxlo) & (P[:, 0] < cxhi)]
     bottom = P[(P[:, 1] > maxy - by) & (P[:, 0] > cxlo) & (P[:, 0] < cxhi)]
     left   = P[(P[:, 0] < minx + bx) & (P[:, 1] > cylo) & (P[:, 1] < cyhi)]
     right  = P[(P[:, 0] > maxx - bx) & (P[:, 1] > cylo) & (P[:, 1] < cyhi)]
 
-    # Fit a line to each edge and compute their intersections
     if min(len(top), len(bottom), len(left), len(right)) >= 15:
         lt, lb = _fit_line(top), _fit_line(bottom)
         ll, lr = _fit_line(left), _fit_line(right)
@@ -249,92 +220,73 @@ def find_quad(mask):
             Minv = cv2.invertAffineTransform(M)
             return _rotate_pts(corners_rot, Minv).astype(np.float32)
 
-    # Fall back to polygon approximation if line fitting fails
     peri = cv2.arcLength(c, True)
     for f in [0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10]:
         approx = cv2.approxPolyDP(c, f * peri, True)
         if len(approx) == 4 and cv2.isContourConvex(approx):
             return approx.reshape(4, 2).astype(np.float32)
 
-    # Final fallback: return the minimum-area bounding rectangle
     return cv2.boxPoints(cv2.minAreaRect(c)).astype(np.float32)
 
 
 def order_corners(pts):
-    """
-    Orders four corners clockwise, starting top-left.
-
-    Everything downstream assumes that order: top-left, top-right, bottom-right, bottom-left.
+    """Sort four corner points into top-left, top-right, bottom-right, bottom-left order.
 
     Args:
-        pts: Array containing four unordered corner points.
+        pts: A (4, 2) array of corner points in any order, as find_quad returns them.
 
     Returns:
-        A (4, 2) array with consistently ordered corner coordinates.
+        A float32 (4, 2) array: top-left, top-right, bottom-right, bottom-left.
     """
-
-    # Compute the sum and difference of each point's coordinates
     s = pts.sum(axis=1)
     d = np.diff(pts, axis=1).reshape(-1)
 
-    # Identify the four corners using coordinate relationships
     tl = pts[np.argmin(s)]
     br = pts[np.argmax(s)]
     tr = pts[np.argmin(d)]
     bl = pts[np.argmax(d)]
 
-    # Return the corners in clockwise order
     return np.float32([tl, tr, br, bl])
 
 
 def rectify(img_bgr, quad, mask, background="white"):
-    """
-    Straightens the card into a flat rectangle and cuts the background away.
-
-    The stencil is warped through the same transform as the photo, so it still lines up pixel for pixel
-    and is then used to fill or make transparent everything outside the card. 
-    It is eroded by one pixel first, which removes the thin halo of table colour along the edge.
+    """Warp the card to a straight, front-facing rectangle and fill the area around it.
 
     Args:
-        img_bgr: Original OpenCV image.
-        quad: Four detected card corners.
-        mask: Binary foreground mask.
-        background: Output background mode ("white", "black", or "none").
+        img_bgr: The photo as a BGR OpenCV image, the same size as mask.
+        quad: The card's four corners in any order, from find_quad.
+        mask: The card's binary mask, from get_mask.
+        background: "white" or "black" fills the area outside the card with that colour, and "none"
+            makes it transparent. Any other value logs a warning and fills black, so a typo in the
+            setting shows up in the log instead of passing silently.
 
     Returns:
-        The rectified card image, or None if the computed output size is invalid.
+        The straightened card, sized to its longer opposite edges: a BGR image, or BGRA for "none".
+        None when either side would be shorter than 2 pixels.
     """
-
-    # Order the detected corners consistently
     src = order_corners(quad)
     (tl, tr, br, bl) = src
 
-    # Compute the dimensions of the rectified image
     w = int(max(np.linalg.norm(br - bl), np.linalg.norm(tr - tl)))
     h = int(max(np.linalg.norm(tr - br), np.linalg.norm(tl - bl)))
     if w < 2 or h < 2:
         return None
 
-    # Compute the perspective transformation
     dst = np.float32([[0, 0], [w - 1, 0], [w - 1, h - 1], [0, h - 1]])
     M = cv2.getPerspectiveTransform(src, dst)
 
-    # Warp the original image
     warped = cv2.warpPerspective(img_bgr, M, (w, h))
 
-    # Warp and refine the segmentation mask
     warped_mask = cv2.warpPerspective(mask, M, (w, h), flags=cv2.INTER_NEAREST)
     _, warped_mask = cv2.threshold(warped_mask, 127, 255, cv2.THRESH_BINARY)
     er = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     warped_mask = cv2.erode(warped_mask, er, iterations=1)
 
-    # Return an RGBA image with a transparent background
     if background == "none":
         out = cv2.cvtColor(warped, cv2.COLOR_BGR2BGRA)
         out[:, :, 3] = warped_mask
         return out
 
-    # Replace the background with the selected solid color
     FILLS = {"white": 255, "black": 0}
     if background not in FILLS:
         logger.warning(
@@ -344,36 +296,29 @@ def rectify(img_bgr, quad, mask, background="white"):
     fill = FILLS.get(background, 0)
     outside = warped_mask == 0
     warped[outside] = fill
-    
     return warped
 
 
 def downscale(img_bgr, max_dim):
-    """
-    Downscales an image so its longest side does not exceed max_dim.
+    """Shrink an image so its longest side is at most max_dim, keeping the aspect ratio.
 
-    Smaller images are returned untouched; nothing is ever upscaled.
+    INTER_AREA interpolation is used because it gives the best quality when shrinking.
 
     Args:
-        img_bgr: OpenCV image.
-        max_dim: Maximum allowed width or height.
+        img_bgr: An OpenCV image.
+        max_dim: The longest side allowed, in pixels.
 
     Returns:
-        The original or resized OpenCV image.
+        The same image object when it already fits (it is never upscaled), otherwise a resized copy.
     """
-
-    # Get the image dimensions
     h, w = img_bgr.shape[:2]
     longest = max(h, w)
 
-    # Skip resizing if the image already fits within the limit
     if longest <= max_dim:
         return img_bgr
 
-    # Compute the scaling factor
     scale = max_dim / float(longest)
 
-    # Resize while preserving the aspect ratio
     return cv2.resize(
         img_bgr,
         (int(round(w * scale)), int(round(h * scale))),
@@ -382,30 +327,22 @@ def downscale(img_bgr, max_dim):
 
 
 def draw_corners(img_bgr, quad):
-    """
-    Draws the detected outline and corners onto the photo.
-
-    This is the visual check: when a card comes out cropped wrong, the overlay shows straight
-    away whether the corners were found in the wrong place.
+    """Draw the card's outline and corners on a copy of the photo, to check the corner detection by eye.
 
     Args:
-        img_bgr: Original OpenCV image.
-        quad: Four detected card corners.
+        img_bgr: The photo as a BGR OpenCV image.
+        quad: The card's four corners in any order, from find_quad.
 
     Returns:
-        A copy of the input image with the detected quadrilateral and corner points drawn.
+        A copy of the photo with the outline in red and the corners as green dots (the colours are
+        given in OpenCV's BGR order); the input image is not changed.
     """
-
-    # Create a copy to avoid modifying the original image
     vis = img_bgr.copy()
 
-    # Order the detected corners consistently
     pts = order_corners(quad).astype(int)
 
-    # Draw the detected card outline - red lines
     cv2.polylines(vis, [pts.reshape(-1, 1, 2)], True, (0, 0, 255), 3)
 
-    # Draw the green detected corner points
     for (x, y) in pts:
         cv2.circle(vis, (int(x), int(y)), 8, (0, 255, 0), -1)
 
@@ -413,41 +350,37 @@ def draw_corners(img_bgr, quad):
 
 
 def encode_corners(img_bgr, quad):
-    """
-    Encodes the corners overlay as PNG bytes.
+    """Encode the corners overlay from draw_corners as a PNG.
 
     Args:
-        img_bgr: Original OpenCV image.
-        quad: Four detected card corners.
+        img_bgr: The photo as a BGR OpenCV image.
+        quad: The card's four corners in any order, from find_quad.
 
     Returns:
-        PNG-encoded image bytes, or None if encoding fails.
+        The PNG bytes, or None when OpenCV cannot encode the image.
     """
-    # Encode the corner visualization as a PNG image
     ok, buf = cv2.imencode(".png", draw_corners(img_bgr, quad))
     return buf.tobytes() if ok else None
 
 
 def _decode_bgr(raw_bytes):
-    """
-    Decodes an uploaded image into an OpenCV BGR image.
+    """Decode uploaded image bytes into a BGR OpenCV image.
 
-    OpenCV handles the common formats but not HEIC, so those fall back to Pillow. 
-    Only an upload that both of them refuse comes back as None.
+    OpenCV decodes the common formats (JPEG, PNG, WebP, BMP, TIFF). It has no HEIC/HEIF codec, so
+    anything it cannot read falls back to Pillow, which reads HEIC/HEIF through the pillow-heif
+    opener registered at import.
 
     Args:
-        raw_bytes: Encoded image bytes.
+        raw_bytes: The uploaded file's bytes.
 
     Returns:
-        OpenCV image in BGR format, or None if decoding fails.
+        The image as a BGR array, or None when neither OpenCV nor Pillow can decode it (the Pillow
+        error is logged as a warning).
     """
-
-    # Attempt decoding using OpenCV
     img = cv2.imdecode(np.frombuffer(raw_bytes, np.uint8), cv2.IMREAD_COLOR)
     if img is not None:
         return img
 
-    # Fall back to Pillow for unsupported image formats (HEIC/HEIF)
     try:
         pil = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
         return cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
@@ -457,27 +390,27 @@ def _decode_bgr(raw_bytes):
 
 
 def process_image(raw_bytes):
-    """
-    Runs the whole cleanup: decode, downscale, segment, find the corners and straighten.
+    """Turn an uploaded photo into a straightened card PNG and a corners-overlay PNG.
 
-    If no card is found the pipeline stops here and returns nothing, 
-    which is how an upload can quietly end up with no finished image.
+    A photo larger than MAX_DIM is downscaled first. The working image is re-encoded for rembg instead
+    of passing the original bytes, so the mask lines up pixel for pixel with the image that is warped,
+    and the overlay is drawn on that same image. The model in SESSION does the segmentation, and
+    BACKGROUND sets the fill around the card.
 
     Args:
-        raw_bytes: Encoded input image.
+        raw_bytes: The uploaded file's bytes, in any format _decode_bgr reads.
 
     Returns:
-        A tuple containing:
-            - Rectified PNG image bytes (or None if no card was extracted).
-            - Corner-overlay PNG image bytes (or None if no card was detected).
-    """
+        (card_png, corners_png), both PNG bytes. card_png is None when no card could be cut out;
+        corners_png is None when no card outline was found or the overlay could not be encoded.
 
-    # Decode the uploaded image
+    Raises:
+        ValueError: The bytes cannot be decoded as an image, or a PNG encoding fails.
+    """
     img = _decode_bgr(raw_bytes)
     if img is None:
         raise ValueError("could not decode image bytes")
 
-    # Downscale large images to reduce processing cost
     h0, w0 = img.shape[:2]
     img = downscale(img, MAX_DIM)
     h1, w1 = img.shape[:2]
@@ -486,27 +419,22 @@ def process_image(raw_bytes):
     else:
         logger.info("[ImageProcessor] input %dx%d (<= MAX_DIM=%d, left as-is)", w0, h0, MAX_DIM)
 
-    # The model must see the same downscaled image, so the mask lines up with what gets warped
     ok, buf = cv2.imencode(".png", img)
     if not ok:
         raise ValueError("PNG re-encode failed")
     work_bytes = buf.tobytes()
 
-    # Generate the segmentation mask and detect the card corners
     mask = get_mask(work_bytes, SESSION)
     quad = find_quad(mask)
     if quad is None:
         return None, None
 
-    # Drawn on the same image the corners were detected on
     corners_png = encode_corners(img, quad)
 
-    # Apply perspective correction.
     out = rectify(img, quad, mask, BACKGROUND)
     if out is None:
         return None, corners_png
 
-    # Encode the rectified image as PNG
     ok, buf = cv2.imencode(".png", out)
     if not ok:
         raise ValueError("PNG encode failed")
@@ -514,41 +442,36 @@ def process_image(raw_bytes):
 
 
 def finished_key(card_id):
-    """
-    Builds the S3 key for the finished card image.
-
-    Named by cardId rather than the slug, so renaming a card never breaks its picture.
+    """Build the S3 key of the cleaned card image.
 
     Args:
-        card_id: Unique identifier of the processed card.
+        card_id: The card's ID, from parse_meta.
 
     Returns:
-        S3 object key for the rectified PNG image.
+        FINISHED_PREFIX followed by "<card_id>.png", for example "images/finished/<cardId>.png".
     """
-
     return f"{FINISHED_PREFIX}{card_id}.png"
 
 
 def corners_key(raw_key):
-    """
-    Builds the S3 key for the corners overlay, next to the original upload.
+    """Build the S3 key of the corners overlay, next to the original upload.
 
-    The handler skips any key ending in __corners.png, so writing this back into the raw prefix cannot re-trigger the pipeline.
+    The key ends in "__corners.png", which the handler skips, and the S3 trigger fires only on ".jpg"
+    keys, so writing the overlay into the upload folder never starts processing again.
 
     Args:
-        raw_key: S3 object key of the uploaded image.
+        raw_key: The S3 key of the uploaded photo, such as "images/raw/<stem>.jpg".
 
     Returns:
-        S3 object key for the corner-overlay PNG image.
+        The key with its extension replaced by "__corners.png", such as
+        "images/raw/<stem>__corners.png".
     """
-
-    # Remove the original file extension while preserving the path
     base = raw_key.rsplit(".", 1)[0] if "." in raw_key else raw_key
 
-    # Append the corner-overlay suffix.
     return f"{base}__corners.png"
 
-# Card-text extraction and metadata
+
+# Every part but the last ends with a space: adjacent string literals are joined without one.
 EXTRACT_SYSTEM = (
     "You are a precise data-extraction assistant for AWS Builder Cards. "
     "Read the card image and return ONLY a JSON object, no commentary. "
@@ -556,6 +479,7 @@ EXTRACT_SYSTEM = (
     "Do not return explanations. "
     "Do not use code fences."
 )
+
 
 EXTRACT_PROMPT = """Return ONLY valid JSON.
 
@@ -658,32 +582,32 @@ If you spot text in bold, write it as for markdown files - that means like this:
 
 
 def _parse_json(text):
-    """
-    Parses the JSON the vision model returned.
+    """Read the card fields out of the vision model's answer.
 
-    The prompt asks for bare JSON and the model wraps it in a code fence anyway, 
-    so the fence is stripped and everything outside the outermost braces is cut.
+    The answer may be wrapped in Markdown code fences or surrounded by other text: the part from the
+    first "{" to the last "}" is parsed.
 
     Args:
-        text: Raw text response produced by the Bedrock vision model.
+        text: The model's text answer.
 
     Returns:
-        Dictionary containing the extracted title, effect, and description.
-    """
+        A dict with exactly the keys "title", "effect" and "description", each a string; a key the
+        model left out or set to null becomes "".
 
-    # Remove optional Markdown code fences
+    Raises:
+        ValueError: The answer holds no valid JSON (json.JSONDecodeError is a ValueError).
+        AttributeError: The answer is valid JSON but not an object.
+    """
     t = text.strip()
     if t.startswith("```"):
         t = t.strip("`")
         if t[:4].lower() == "json":
             t = t[4:]
 
-    # Extract the JSON object from the response
     i, j = t.find("{"), t.rfind("}")
     if i != -1 and j != -1:
         t = t[i:j + 1]
 
-    # Parse the JSON and normalize the expected fields
     data = json.loads(t)
     return {
         "title": str(data.get("title", "") or ""),
@@ -693,19 +617,21 @@ def _parse_json(text):
 
 
 def extract_card_fields(png_bytes):
-    """
-    Reads the card's title, effect and description with a Bedrock vision model.
+    """Have the Bedrock vision model draft the card's title, effect and description.
 
-    It is given the straightened image, not the original photo, and the temperature is 0 because this is extraction and not writing.
+    The role sentence is sent only once, in the system prompt EXTRACT_SYSTEM; the user message holds
+    the task, EXTRACT_PROMPT, and the image.
 
     Args:
-        png_bytes: PNG-encoded rectified card image.
+        png_bytes: The straightened card as PNG bytes.
 
     Returns:
-        Dictionary containing the extracted title, effect, and description.
-    """
+        The drafted fields, as _parse_json returns them.
 
-    # Invoke the Bedrock vision model
+    Raises:
+        botocore.exceptions.ClientError: The Bedrock call fails.
+        ValueError: The answer holds no valid JSON.
+    """
     resp = bedrock.converse(
         modelId=BEDROCK_MODEL_ID,
         system=[{"text": EXTRACT_SYSTEM}],
@@ -719,30 +645,25 @@ def extract_card_fields(png_bytes):
         inferenceConfig={"maxTokens": 1200, "temperature": 0.0},
     )
 
-    # Parse the model response
     text = resp["output"]["message"]["content"][0]["text"]
     return _parse_json(text)
 
 
 def parse_meta(raw_key):
-    """
-    Reads the event, year and card id back out of the upload's filename.
+    """Split an upload's S3 key into its event name, year and card ID.
 
-    The upload lambda builds that name as <event>_<year>_<cardId>
-    and strips underscores out of the event, so splitting on "_" here stays correct.
+    get-upload-url names uploads images/raw/<event>_<year>_<cardId>.jpg, with no "_" in the event.
 
     Args:
-        raw_key: S3 object key of the uploaded image.
+        raw_key: The S3 key of the uploaded photo.
 
     Returns:
-        Tuple containing (event, year, card_id).
+        (event, year, card_id) as strings, with hyphens in the event turned into spaces. A file name
+        with fewer than three "_"-separated parts gives ("", "", <file name without extension>).
     """
-
-    # Extract the filename without its extension
     filename = raw_key.split("/")[-1]
     stem = filename.rsplit(".", 1)[0]
 
-    # Split the filename into its metadata components
     parts = stem.split("_")
     if len(parts) >= 3:
         card_id = parts[-1]
@@ -755,60 +676,53 @@ def parse_meta(raw_key):
 
 
 def slugify(text):
-    """
-    Converts a string into a URL-friendly slug.
-
-    Lowercase, with anything non-alphanumeric turned into a single hyphen, 
-    so f.e. "AWS Summit Hong Kong 2025" becomes "aws-summit-hong-kong-2025".
+    """Turn text into a URL slug: lowercase ASCII letters and digits joined by single hyphens.
 
     Args:
-        text: Input string.
+        text: The text to turn into a slug; None counts as empty.
 
     Returns:
-        URL-friendly slug.
+        The slug, for example "aws-summit-hong-kong-2025" for "AWS Summit Hong Kong 2025". It is ""
+        when the text has no ASCII letters or digits.
     """
-
-    # Normalize the input string
     s = (text or "").strip().lower()
 
-    # Replace non-alphanumeric characters with hyphens
     s = re.sub(r"[^a-z0-9]+", "-", s)
 
-    # Remove leading and trailing hyphens
     return s.strip("-")
 
 
 def write_card_item(card_id, event, year, raw_key, fin_key, fields, uploader=""):
-    """
-    Creates the card's pending record in DynamoDB.
+    """Store a new card in DynamoDB as a pending draft for review.
 
-    Every model-written value lands in its own *_ai_draft field and the approved fields are written empty, 
-    so the model has no way to write a value that gets published.
+    The model's title, effect and description, and a slug made from the title and the year, go into
+    the *_ai_draft attributes; the approved attributes start empty and are filled in at review. The
+    year is added to the slug only when the title does not already contain it, so a title such as
+    "AWS Summit Katowice 2025" does not give "aws-summit-katowice-2025-2025". The write replaces any
+    existing item with the same cardId.
 
     Args:
-        card_id: Unique identifier of the card.
-        event: Event where the card was obtained.
-        year: Event year.
-        raw_key: S3 key of the uploaded image.
-        fin_key: S3 key of the rectified card image.
-        fields: Dictionary containing AI-generated card fields.
-        uploader: Optional uploader attribution stored in the S3 object metadata.
+        card_id: The card's ID, from parse_meta.
+        event: The event name, from parse_meta.
+        year: The event year, from parse_meta; may be empty.
+        raw_key: The S3 key of the uploaded photo.
+        fin_key: The S3 key of the cleaned card image.
+        fields: The drafted fields, as extract_card_fields returns them; a missing key counts as "".
+        uploader: The uploader's name from the upload's metadata; "" when none was given.
 
     Returns:
-        None. The card record is written to DynamoDB as a side effect, where it waits with
-        status "pending" until a human approves it.
-    """
+        None. Writes the item, with status "pending", to the DDB_TABLE table.
 
-    # Generate a timestamp for the new record
+    Raises:
+        botocore.exceptions.ClientError: The DynamoDB write fails.
+    """
     now = datetime.now(timezone.utc).isoformat()
 
-    # The year is only appended when the title does not already carry it
     title_draft = fields.get("title", "")
     year_str = str(year).strip()
     slug_src = f"{title_draft} {year_str}" if year_str and year_str not in title_draft else title_draft
     slug_draft = slugify(slug_src)
 
-    # Store the pending card record in DynamoDB
     ddb.put_item(
         TableName=DDB_TABLE,
         Item={
@@ -837,40 +751,38 @@ def write_card_item(card_id, event, year, raw_key, fin_key, fields, uploader="")
 
 
 def publish_upload_notification(bucket, finished_key, card_id, event_name, year, title_draft, raw_key, event_time=""):
-    """
-    Sends the email saying a new card is waiting to be reviewed.
+    """Send the "new card uploaded" message to the SNS topic, which emails the maintainer.
 
-    It carries the card's metadata, CLI commands for pulling the three images down, and the link to the review editor. 
-    Sending is best effort, so a failed email cannot fail the pipeline.
+    The message holds the card's metadata, aws s3 cp commands that download the original photo into
+    RAW_DOWNLOAD_DIR, the corners overlay into CORNERS_DOWNLOAD_DIR and the cleaned image into
+    STATIC_CARDS_DIR, and the REVIEW_URL link. It is best-effort: a failed publish is logged and never
+    fails the card.
 
     Args:
-        bucket: S3 bucket containing the uploaded images.
-        finished_key: S3 key of the rectified card image.
-        card_id: Unique identifier of the processed card.
-        event_name: Event where the card was obtained.
-        year: Event year.
-        title_draft: AI-generated draft title.
-        raw_key: S3 key of the original uploaded image.
-        event_time: Optional upload timestamp.
+        bucket: The S3 bucket of the images.
+        finished_key: The S3 key of the cleaned card image.
+        card_id: The card's ID.
+        event_name: The event name; "Unknown" is shown when it is empty.
+        year: The event year; "Unknown" is shown when it is empty.
+        title_draft: The model's draft title; "(none)" is shown when it is empty.
+        raw_key: The S3 key of the uploaded photo; when it is empty, only the cleaned image's
+            download command is included.
+        event_time: The upload time from the S3 event record; "Unknown" is shown when it is empty.
 
     Returns:
-        None. The notification is published as a side effect; the function returns early without
-        publishing when no SNS topic is configured.
+        None. Publishes the message to SNS_TOPIC_ARN, or only logs that it skipped when SNS_TOPIC_ARN
+        is empty.
     """
-
-    # Skip notification if no SNS topic has been configured
     if not SNS_TOPIC_ARN:
         logger.info("[ImageProcessor] SNS_TOPIC_ARN not set, skipping notification")
         return
 
-    # Build the download command for the rectified card image
     finished_cmd = (
         "# 3) Cropped / finished card -> Hugo static/cards\n"
         f"cd {STATIC_CARDS_DIR}\n"
         f"aws s3 cp s3://{bucket}/{finished_key} {card_id}.png"
     )
 
-    # Build download commands for the original image and corner visualization
     if raw_key:
         raw_name = raw_key.split("/")[-1]
         base = raw_key.rsplit(".", 1)[0] if "." in raw_key else raw_key
@@ -891,7 +803,6 @@ def publish_upload_notification(bucket, finished_key, card_id, event_name, year,
             + "\n\n(original + corners links unavailable: no rawKey on this card record)"
         )
 
-    # Compose the notification email
     message = f"""New Builder Card uploaded!
 
 === IMAGE INFO ===
@@ -909,9 +820,13 @@ Upload Time: {event_time or "Unknown"}
 {download_block}
 
 === ACCESS THE CARD DETAILS ===
-{REVIEW_URL or "(review URL not configured)"}"""
+{REVIEW_URL or "(review URL not configured)"}
 
-    # Publish the SNS notification
+=== DB VERIFICATION ===
+verify the DB values at:
+source local-tools/card-editor/.venv/bin/activate
+python local-tools/card-editor/review.py"""
+
     try:
         sns.publish(
             TopicArn=SNS_TOPIC_ARN,
@@ -919,30 +834,51 @@ Upload Time: {event_time or "Unknown"}
             Message=message,
         )
         logger.info("[ImageProcessor] SNS notification sent for %s", finished_key)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - non-fatal
         logger.exception("[ImageProcessor] failed to send SNS notification: %s", e)
 
 
 def handler(event, context):
-    """
-    Lambda entry point: cleans up each uploaded image, then drafts and records its text.
+    """Process each uploaded photo in an S3 event into a pending card.
 
-    The database record is written before the finished image, so nothing downstream can race anitem that does not exist yet.
-    A record that raises is logged and the rest still run.
+    card-detect invokes this function asynchronously with one S3 event record per upload it lets
+    through. For each record, the photo becomes a straightened card, a corners overlay is written next
+    to the upload, Bedrock drafts the text, a pending DynamoDB item is written, the cleaned image goes
+    under FINISHED_PREFIX and an SNS email announces the card.
+
+    Keys outside RAW_PREFIX, ".keep" folder placeholders and "__corners.png" overlays are skipped, so
+    the overlay this function writes into the upload folder is never processed as a card. The
+    uploader's name is the object's "uploader" metadata: get-upload-url signs it as the
+    x-amz-meta-uploader field of the pre-signed POST, and boto3 returns user metadata keys lowercased
+    and without the x-amz-meta- prefix.
+
+    The Bedrock draft, the DynamoDB write, the overlay write and the email are best-effort: a failure
+    is logged and the record goes on. Any other failure ends that record with status "error", and the
+    next record is processed.
+
+    When any record failed, the function raises after the loop. card-detect invokes it
+    asynchronously, and Lambda retries an asynchronous event only when the function fails, so
+    returning normally would drop a card after a temporary S3 error for good. A retry is safe: the
+    cardId comes from the upload's key, so it rewrites the same card rather than adding one; it does
+    cost a second Bedrock call.
 
     Args:
-        event: S3 event notification; only its "Records" list is read.
-        context: Lambda context object, unused.
+        event: An S3 event, {"Records": [...]}; each record has s3.bucket.name, s3.object.key
+            (URL-encoded, as S3 sends it) and optionally eventTime.
+        context: The Lambda context object; not used.
 
     Returns:
-        Dict with statusCode 200 and a JSON body listing one result per record.
-    """
+        {"statusCode": 200, "body": <JSON string>}, where the body is {"results": [...]} with one
+        entry per processed record: {"key": ..., "finished": ..., "status": "ok"} or
+        {"key": ..., "status": "no_card"}. Skipped records get no entry, so an empty list means
+        nothing was processed.
 
-    # Log the configured processing settings
+    Raises:
+        RuntimeError: One or more records failed; the message lists their keys.
+    """
     logger.info("[ImageProcessor] model=%s background=%s", MODEL, BACKGROUND)
     results = []
 
-    # Process each S3 event record independently
     for record in event.get("Records", []):
         s3_info = record.get("s3", {})
         bucket = s3_info.get("bucket", {}).get("name")
@@ -951,10 +887,8 @@ def handler(event, context):
             logger.info("[ImageProcessor] missing bucket/key, skipping")
             continue
 
-        # Decode URL-escaped S3 object keys
         key = urllib.parse.unquote_plus(key)
 
-        # Skip non-image objects and generated helper images
         if key.endswith(".keep"):
             logger.info("[ImageProcessor] skipping .keep placeholder")
             continue
@@ -965,49 +899,42 @@ def handler(event, context):
             logger.info("[ImageProcessor] key not under RAW_PREFIX=%s, skipping", RAW_PREFIX)
             continue
 
-        # Download and process the uploaded image
         logger.info("[ImageProcessor] processing s3://%s/%s", bucket, key)
         try:
             obj = s3.get_object(Bucket=bucket, Key=key)
             raw = obj["Body"].read()
 
-            # The uploader's name rides along as object metadata, set by the signed upload
             uploader = obj.get("Metadata", {}).get("uploader", "")
 
-            # Detect and straighten the card
             png, corners_png = process_image(raw)
             if png is None:
                 logger.warning("[ImageProcessor] no card detected in %s", key)
                 results.append({"key": key, "status": "no_card"})
                 continue
 
-            # Keep the corners overlay next to the original, as a visual check
             if corners_png is not None:
                 ck = corners_key(key)
                 try:
                     s3.put_object(Bucket=bucket, Key=ck, Body=corners_png, ContentType="image/png")
                     logger.info("[ImageProcessor] wrote corners overlay s3://%s/%s", bucket, ck)
-                except Exception as ex:
+                except Exception as ex:  # noqa: BLE001 - non-fatal
                     logger.exception("[ImageProcessor] corners write failed: %s", ex)
 
-            # Read the metadata first, so the finished image can be named by cardId
             event_name, year, card_id = parse_meta(key)
             out_key = finished_key(card_id)
 
-            # Both of these are best effort and neither is allowed to fail the pipeline
             fields = {"title": "", "effect": "", "description": ""}
             try:
                 fields = extract_card_fields(png)
                 logger.info("[ImageProcessor] extracted title=%r", fields.get("title", ""))
-            except Exception as ex:
+            except Exception as ex:  # noqa: BLE001
                 logger.exception("[ImageProcessor] Bedrock extraction failed: %s", ex)
             try:
                 write_card_item(card_id, event_name, year, key, out_key, fields, uploader)
                 logger.info("[ImageProcessor] wrote DynamoDB item cardId=%s (pending)", card_id)
-            except Exception as ex:
+            except Exception as ex:  # noqa: BLE001
                 logger.exception("[ImageProcessor] DynamoDB write failed: %s", ex)
 
-            # Write the finished image, after the record that points at it
             s3.put_object(
                 Bucket=bucket,
                 Key=out_key,
@@ -1016,17 +943,17 @@ def handler(event, context):
             )
             logger.info("[ImageProcessor] wrote s3://%s/%s", bucket, out_key)
 
-            # Tell me there is a card to review
             publish_upload_notification(
                 bucket, out_key, card_id, event_name, year,
                 fields.get("title", ""), key, record.get("eventTime", ""),
             )
 
             results.append({"key": key, "finished": out_key, "status": "ok"})
-        except Exception as e:
-            # Continue processing remaining records even if one fails
+        except Exception as e:  # noqa: BLE001 - log and continue to next record
             logger.exception("[ImageProcessor] failed on %s: %s", key, e)
             results.append({"key": key, "status": "error", "error": str(e)})
 
-    # Return the processing summary
+    failed = [r["key"] for r in results if r.get("status") == "error"]
+    if failed:
+        raise RuntimeError(f"{len(failed)} record(s) failed, raising so Lambda retries the event: {failed}")
     return {"statusCode": 200, "body": json.dumps({"results": results})}

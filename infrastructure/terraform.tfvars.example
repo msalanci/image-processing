@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Michal Salanci
+#
+# terraform.tfvars.example — the values this stack needs, with placeholders.
+#
+#   cp terraform.tfvars.example terraform.tfvars    # then put in your own values
+#
+# terraform.tfvars is git-ignored (.gitignore): it holds your email, your GitHub site repository and your
+# Amplify app ID. Every variable is described in variables.tf; the ones with a default there can be left
+# out. Secrets (the GitHub token, the review editor's Basic Auth) live in AWS Secrets Manager and are set
+# out-of-band, never here.
+
+aws_region = "eu-central-1"
+
+images_bucket_name = "my-buildercards-images"
+
+notification_email = "you@example.com"
+
+github_owner       = "your-github-user"
+github_repo        = "your-site-repo"
+github_base_branch = "main"
+
+github_publish_branch = "main"
+
+bedrock_llm    = "eu.amazon.nova-2-lite-v1:0"
+bedrock_region = "eu-central-1"
+
+amplify_app_id      = "d1a2b3c4d5e6f7"
+amplify_branch_name = "main"

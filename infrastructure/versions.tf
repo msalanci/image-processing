@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Michal Salanci
 #
-# Terraform and provider version constraints
+# Version constraints for Terraform and its providers, and the AWS provider, whose default tags mark
+# every taggable resource as part of this project.
 
 terraform {
   required_version = ">= 1.15.0"

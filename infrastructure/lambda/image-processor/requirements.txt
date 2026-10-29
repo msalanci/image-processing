@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Michal Salanci
-
-
-# Card-cleanup container Lambda dependencies (CPU only).
-rembg[cpu]==2.0.78
+#
+# Python packages for the image-processor Lambda image. boto3 is not listed because the Lambda base image already has it
+# rembg brings its onnxruntime engine only with the [cpu] extra; without it new_session() fails with "No onnxruntime backend found"
+rembg[cpu]==2.0.86
 opencv-python-headless==5.0.0.93
-numpy==2.4.6
-pillow==12.3.0
-pillow-heif==1.5.0
+numpy==2.5.4
+
+# pillow 13 moves the cut-out card's edge by a few pixels (invisible); 
+# 12.3.0 gives output byte-identical to the images built before
+# 13.0.0 removes little more pixels (not visible by human eye)
+# Uncoment which pillow is preffered
+pillow==13.0.0
+# pillow==12.3.0
+pillow-heif==1.8.1

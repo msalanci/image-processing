@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Michal Salanci
 #
-# Outputs for the images bucket, the two API endpoints and the SNS topics.
+# Outputs of the stack: the images bucket and its prefixes, the upload Lambda and its API
+# endpoint, the review editor URL, and the ARNs of the live SNS notification topics.
 
 output "images_bucket_name" {
   description = "Name of the BuilderCards images bucket"
@@ -39,12 +40,12 @@ output "upload_notification_topic_arn" {
 }
 
 output "deploy_notification_topic_arn" {
-  description = "Topic ARN for Amplify deploy (success/failure) notifications"
+  description = "SNS3 Topic ARN for Amplify deploy (success/failure) notifications"
   value       = aws_sns_topic.deploy_notifications.arn
 }
 
 output "reject_notification_topic_arn" {
-  description = "Topic ARN for card-detect reject notifications"
+  description = "SNS4 Topic ARN for card-detect reject notifications"
   value       = aws_sns_topic.reject_notifications.arn
 }
 

@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Michal Salanci
 #
-# BUILD-TIME dependencies for build_onnx.py
-# used ONCE on local machine to generate the ONNX model artifacts (onnx_out/). 
-# These are HEAVY (PyTorch) and are NOT shipped in the Lambda image: the card-detect runtime is torch-free
-# (onnxruntime + numpy + pillow + pillow-heif — see requirements.txt). 
-# This file is excluded from the Docker build via .dockerignore.
+# BUILD-TIME dependencies for build_onnx.py ONLY — used ONCE on your machine to
+# generate the ONNX model artifacts (onnx_out/). These are HEAVY (PyTorch) and are
+# NOT shipped in the Lambda image: the card-detect runtime is torch-free
+# (onnxruntime + numpy + pillow + pillow-heif — see requirements.txt). This file is
+# excluded from the Docker build via .dockerignore.
 #
 #   cd infrastructure/lambda/card-detect
 #   python3 -m venv .venv && source .venv/bin/activate
@@ -16,5 +16,12 @@ torch==2.13.0
 open_clip_torch==3.3.0
 numpy==2.5.1
 onnx==1.22.0
+
+# REQUIRED since torch 2.9 made the dynamo exporter the default for
+# torch.onnx.export(). onnxscript is NOT a torch dependency, so without this line
+# the export dies with "ModuleNotFoundError: No module named 'onnxscript'" —
+# torch imports it lazily, so pip install succeeds and the failure only shows up
+# at export time. onnx_ir is pulled in by onnxscript; pinned so a clean venv is
+# reproducible.
 onnxscript==0.7.1
 onnx_ir==0.2.1

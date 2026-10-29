@@ -1,15 +1,10 @@
 {
-  "_license": "SPDX-License-Identifier: MIT - Copyright (c) 2026 Michal Salanci",
   "Records": [
     {
       "eventTime": "2026-06-20T12:00:00.000Z",
       "s3": {
-        "bucket": {
-          "name": "REPLACE_WITH_YOUR_BUCKET_NAME"
-        },
-        "object": {
-          "key": "images/raw/REPLACE_WITH_A_REAL_RAW_OBJECT.jpg"
-        }
+        "bucket": { "name": "REPLACE_WITH_YOUR_IMAGES_BUCKET" },
+        "object": { "key": "images/raw/REPLACE_WITH_A_REAL_RAW_OBJECT.jpg" }
       }
     }
   ]

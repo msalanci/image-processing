@@ -1,10 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Michal Salanci
 #
-# IAM roles
+# IAM roles and policies of the five Lambda functions, and the trust policy they share.
+# Only the invoke-only committer can read the GitHub PAT or delete DynamoDB items; the
+# internet-facing review editor reaches those powers only by invoking it.
+# No role gets s3:DeleteObjectVersion, so deletes on the versioned bucket stay recoverable.
+
+locals {
+  # After changing var.bedrock_llm, check that `aws bedrock get-inference-profile
+  # --inference-profile-identifier <id> --query 'models[].modelArn'` returns model ids that
+  # match this derivation, or extraction silently returns empty fields.
+  bedrock_fm_id = replace(var.bedrock_llm, "/^(us|eu|apac|jp|global|us-gov)\\./", "")
+}
 
 data "aws_iam_policy_document" "lambda_assume_role" {
   statement {
+    sid     = "LambdaAssumesRole"
     effect  = "Allow"
     actions = ["sts:AssumeRole"]
     principals {
@@ -21,7 +32,7 @@ resource "aws_iam_role" "get_upload_url" {
 
 resource "aws_iam_role_policy_attachment" "get_upload_url_basic" {
   role       = aws_iam_role.get_upload_url.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
 resource "aws_iam_role_policy" "get_upload_url_presign" {
@@ -31,9 +42,12 @@ resource "aws_iam_role_policy" "get_upload_url_presign" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect   = "Allow"
-        Action   = ["s3:PutObject"]
-        Resource = "arn:aws:s3:::${var.images_bucket_name}/${var.raw_prefix}*"
+        Sid    = "WriteRawUploads"
+        Effect = "Allow"
+        Action = [
+          "s3:PutObject",
+        ]
+        Resource = "arn:${data.aws_partition.current.partition}:s3:::${var.images_bucket_name}/${var.raw_prefix}*"
       }
     ]
   })
@@ -46,7 +60,7 @@ resource "aws_iam_role" "image_processor" {
 
 resource "aws_iam_role_policy_attachment" "image_processor_basic" {
   role       = aws_iam_role.image_processor.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
 resource "aws_iam_role_policy" "image_processor_s3" {
@@ -59,26 +73,22 @@ resource "aws_iam_role_policy" "image_processor_s3" {
         Sid      = "ReadRaw"
         Effect   = "Allow"
         Action   = ["s3:GetObject"]
-        Resource = "arn:aws:s3:::${var.images_bucket_name}/${var.raw_prefix}*"
+        Resource = "arn:${data.aws_partition.current.partition}:s3:::${var.images_bucket_name}/${var.raw_prefix}*"
       },
       {
         Sid      = "WriteCornersToRaw"
         Effect   = "Allow"
         Action   = ["s3:PutObject"]
-        Resource = "arn:aws:s3:::${var.images_bucket_name}/${var.raw_prefix}*"
+        Resource = "arn:${data.aws_partition.current.partition}:s3:::${var.images_bucket_name}/${var.raw_prefix}*"
       },
       {
         Sid      = "WriteFinished"
         Effect   = "Allow"
         Action   = ["s3:PutObject"]
-        Resource = "arn:aws:s3:::${var.images_bucket_name}/${var.finished_prefix}*"
+        Resource = "arn:${data.aws_partition.current.partition}:s3:::${var.images_bucket_name}/${var.finished_prefix}*"
       }
     ]
   })
-}
-
-locals {
-  bedrock_fm_id = replace(var.bedrock_llm, "/^(us|eu|apac|jp|global|us-gov)\\./", "")
 }
 
 resource "aws_iam_role_policy" "image_processor_extract" {
@@ -88,18 +98,26 @@ resource "aws_iam_role_policy" "image_processor_extract" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "DynamoWrite"
-        Effect   = "Allow"
-        Action   = ["dynamodb:PutItem"]
-        Resource = [aws_dynamodb_table.cards.arn]
+        Sid    = "DynamoWrite"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:PutItem",
+        ]
+        Resource = [
+          aws_dynamodb_table.cards.arn,
+        ]
       },
       {
         Sid    = "BedrockInvoke"
         Effect = "Allow"
+        # Converse authorizes against bedrock:InvokeModel; there is no bedrock:Converse action.
         Action = ["bedrock:InvokeModel"]
+        # The region stays "*": a geo inference profile routes each call to the model in any of
+        # its destination regions, a list AWS can change, and a region left out fails only the
+        # calls routed there.
         Resource = [
-          "arn:aws:bedrock:*::foundation-model/${local.bedrock_fm_id}",
-          "arn:aws:bedrock:*:${data.aws_caller_identity.current.account_id}:inference-profile/${var.bedrock_llm}",
+          "arn:${data.aws_partition.current.partition}:bedrock:*::foundation-model/${local.bedrock_fm_id}",
+          "arn:${data.aws_partition.current.partition}:bedrock:*:${data.aws_caller_identity.current.account_id}:inference-profile/${var.bedrock_llm}",
         ]
       }
     ]
@@ -113,9 +131,83 @@ resource "aws_iam_role_policy" "image_processor_sns" {
     Version = "2012-10-17"
     Statement = [
       {
+        Sid      = "PublishUploadNotifications"
         Effect   = "Allow"
         Action   = ["sns:Publish"]
         Resource = aws_sns_topic.upload_notifications.arn
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role" "committer" {
+  name               = "BuilderCardsCommitterRole"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume_role.json
+}
+
+resource "aws_iam_role_policy_attachment" "committer_basic" {
+  role       = aws_iam_role.committer.name
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+resource "aws_iam_role_policy" "committer_github_secret" {
+  name = "BuilderCardsCommitterReadGithubPat"
+  role = aws_iam_role.committer.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "ReadGithubPat"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = aws_secretsmanager_secret.github_pat.arn
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "committer_ddb" {
+  name = "BuilderCardsCommitterDynamo"
+  role = aws_iam_role.committer.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "ReadAndDeleteCards"
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:DeleteItem",
+        ]
+        Resource = aws_dynamodb_table.cards.arn
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "committer_s3" {
+  name = "BuilderCardsCommitterS3"
+  role = aws_iam_role.committer.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "ReadFinished"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject"]
+        Resource = "arn:${data.aws_partition.current.partition}:s3:::${var.images_bucket_name}/${var.finished_prefix}*"
+      },
+      {
+        Sid      = "DeleteRaw"
+        Effect   = "Allow"
+        Action   = ["s3:DeleteObject"]
+        Resource = "arn:${data.aws_partition.current.partition}:s3:::${var.images_bucket_name}/${var.raw_prefix}*"
+      },
+      {
+        Sid      = "DeleteFinished"
+        Effect   = "Allow"
+        Action   = ["s3:DeleteObject"]
+        Resource = "arn:${data.aws_partition.current.partition}:s3:::${var.images_bucket_name}/${var.finished_prefix}*"
       }
     ]
   })
@@ -128,7 +220,7 @@ resource "aws_iam_role" "review_editor" {
 
 resource "aws_iam_role_policy_attachment" "review_editor_basic" {
   role       = aws_iam_role.review_editor.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
 resource "aws_iam_role_policy" "review_editor_ddb" {
@@ -138,6 +230,7 @@ resource "aws_iam_role_policy" "review_editor_ddb" {
     Version = "2012-10-17"
     Statement = [
       {
+        Sid    = "ReadAndEditCards"
         Effect = "Allow"
         Action = [
           "dynamodb:GetItem",
@@ -161,6 +254,7 @@ resource "aws_iam_role_policy" "review_editor_secret" {
     Version = "2012-10-17"
     Statement = [
       {
+        Sid      = "ReadBasicAuthSecret"
         Effect   = "Allow"
         Action   = ["secretsmanager:GetSecretValue"]
         Resource = aws_secretsmanager_secret.review_basic_auth.arn
@@ -176,9 +270,10 @@ resource "aws_iam_role_policy" "review_editor_s3_finished" {
     Version = "2012-10-17"
     Statement = [
       {
+        Sid      = "ReadFinishedImages"
         Effect   = "Allow"
         Action   = ["s3:GetObject"]
-        Resource = "arn:aws:s3:::${var.images_bucket_name}/${var.finished_prefix}*"
+        Resource = "arn:${data.aws_partition.current.partition}:s3:::${var.images_bucket_name}/${var.finished_prefix}*"
       }
     ]
   })
@@ -191,6 +286,7 @@ resource "aws_iam_role_policy" "review_editor_invoke_committer" {
     Version = "2012-10-17"
     Statement = [
       {
+        Sid      = "InvokeCommitter"
         Effect   = "Allow"
         Action   = ["lambda:InvokeFunction"]
         Resource = aws_lambda_function.committer.arn
@@ -209,7 +305,7 @@ resource "aws_iam_role_policy" "review_editor_rejected_s3" {
         Sid      = "ListRejected"
         Effect   = "Allow"
         Action   = ["s3:ListBucket"]
-        Resource = "arn:aws:s3:::${var.images_bucket_name}"
+        Resource = "arn:${data.aws_partition.current.partition}:s3:::${var.images_bucket_name}"
         Condition = {
           StringLike = { "s3:prefix" = "${var.rejected_prefix}*" }
         }
@@ -218,90 +314,19 @@ resource "aws_iam_role_policy" "review_editor_rejected_s3" {
         Sid      = "ReadRejected"
         Effect   = "Allow"
         Action   = ["s3:GetObject"]
-        Resource = "arn:aws:s3:::${var.images_bucket_name}/${var.rejected_prefix}*"
+        Resource = "arn:${data.aws_partition.current.partition}:s3:::${var.images_bucket_name}/${var.rejected_prefix}*"
       },
       {
         Sid      = "DeleteRejected"
         Effect   = "Allow"
         Action   = ["s3:DeleteObject"]
-        Resource = "arn:aws:s3:::${var.images_bucket_name}/${var.rejected_prefix}*"
+        Resource = "arn:${data.aws_partition.current.partition}:s3:::${var.images_bucket_name}/${var.rejected_prefix}*"
       },
       {
         Sid      = "ReprocessWriteRaw"
         Effect   = "Allow"
         Action   = ["s3:PutObject"]
-        Resource = "arn:aws:s3:::${var.images_bucket_name}/${var.raw_prefix}*"
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role" "committer" {
-  name               = "BuilderCardsCommitterRole"
-  assume_role_policy = data.aws_iam_policy_document.lambda_assume_role.json
-}
-
-resource "aws_iam_role_policy_attachment" "committer_basic" {
-  role       = aws_iam_role.committer.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-}
-
-resource "aws_iam_role_policy" "committer_github_secret" {
-  name = "BuilderCardsCommitterReadGithubPat"
-  role = aws_iam_role.committer.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect   = "Allow"
-        Action   = ["secretsmanager:GetSecretValue"]
-        Resource = aws_secretsmanager_secret.github_pat.arn
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy" "committer_ddb" {
-  name = "BuilderCardsCommitterDynamo"
-  role = aws_iam_role.committer.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "dynamodb:GetItem",
-          "dynamodb:DeleteItem",
-        ]
-        Resource = aws_dynamodb_table.cards.arn
-      }
-    ]
-  })
-}
-
-resource "aws_iam_role_policy" "committer_s3" {
-  name = "BuilderCardsCommitterS3"
-  role = aws_iam_role.committer.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid      = "ReadFinished"
-        Effect   = "Allow"
-        Action   = ["s3:GetObject"]
-        Resource = "arn:aws:s3:::${var.images_bucket_name}/${var.finished_prefix}*"
-      },
-      {
-        Sid      = "DeleteRaw"
-        Effect   = "Allow"
-        Action   = ["s3:DeleteObject"]
-        Resource = "arn:aws:s3:::${var.images_bucket_name}/${var.raw_prefix}*"
-      },
-      {
-        Sid      = "DeleteFinished"
-        Effect   = "Allow"
-        Action   = ["s3:DeleteObject"]
-        Resource = "arn:aws:s3:::${var.images_bucket_name}/${var.finished_prefix}*"
+        Resource = "arn:${data.aws_partition.current.partition}:s3:::${var.images_bucket_name}/${var.raw_prefix}*"
       }
     ]
   })
@@ -314,7 +339,7 @@ resource "aws_iam_role" "card_detect" {
 
 resource "aws_iam_role_policy_attachment" "card_detect_basic" {
   role       = aws_iam_role.card_detect.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
 resource "aws_iam_role_policy" "card_detect_s3" {
@@ -327,19 +352,19 @@ resource "aws_iam_role_policy" "card_detect_s3" {
         Sid      = "ReadRaw"
         Effect   = "Allow"
         Action   = ["s3:GetObject"]
-        Resource = "arn:aws:s3:::${var.images_bucket_name}/${var.raw_prefix}*"
+        Resource = "arn:${data.aws_partition.current.partition}:s3:::${var.images_bucket_name}/${var.raw_prefix}*"
       },
       {
         Sid      = "QuarantineDeleteRaw"
         Effect   = "Allow"
         Action   = ["s3:DeleteObject"]
-        Resource = "arn:aws:s3:::${var.images_bucket_name}/${var.raw_prefix}*"
+        Resource = "arn:${data.aws_partition.current.partition}:s3:::${var.images_bucket_name}/${var.raw_prefix}*"
       },
       {
         Sid      = "QuarantineWriteRejected"
         Effect   = "Allow"
         Action   = ["s3:PutObject"]
-        Resource = "arn:aws:s3:::${var.images_bucket_name}/${var.rejected_prefix}*"
+        Resource = "arn:${data.aws_partition.current.partition}:s3:::${var.images_bucket_name}/${var.rejected_prefix}*"
       }
     ]
   })
@@ -352,6 +377,7 @@ resource "aws_iam_role_policy" "card_detect_invoke_processor" {
     Version = "2012-10-17"
     Statement = [
       {
+        Sid      = "InvokeImageProcessor"
         Effect   = "Allow"
         Action   = ["lambda:InvokeFunction"]
         Resource = aws_lambda_function.image_processor.arn
@@ -367,6 +393,7 @@ resource "aws_iam_role_policy" "card_detect_sns" {
     Version = "2012-10-17"
     Statement = [
       {
+        Sid      = "PublishRejectNotifications"
         Effect   = "Allow"
         Action   = ["sns:Publish"]
         Resource = aws_sns_topic.reject_notifications.arn

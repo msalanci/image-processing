@@ -1,33 +1,30 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Michal Salanci
 #
-# CPU container image for the card-cleanup Lambda (rembg/BiRefNet + OpenCV).
-# Build for arm64 (Graviton).
-#
-# Build (on the M4 mac, native arm64):
-#   docker build --platform linux/arm64 -t buildercards-image-processor .
-#
-# The BiRefNet-lite weights (~224 MB) are downloaded at BUILD time into /opt/models socold starts do not fetch them. 
-# U2NET_HOME tells rembg where to find them.
+# Container image for the image-processor Lambda, which card-detect invokes for each photo that may
+# be a card: it cuts the card out with rembg (BiRefNet on onnxruntime, CPU), straightens it with
+# OpenCV, has Bedrock draft its text, and stores the result for the maintainer's review.
+# Inputs: requirements.txt, app.py and the REMBG_MODEL build argument. The model is downloaded
+# into the image at build time, so a cold start never fetches it.
+# Lambda needs an arm64 image without attestations:
+#   docker buildx build --platform linux/arm64 --provenance=false -t buildercards-image-processor .
 
-FROM public.ecr.aws/lambda/python:3.14
+FROM public.ecr.aws/lambda/python:3.14@sha256:fc4e15a5e09e2c9b6184810ea0fdc87afe1c1c734c98cbe27d739a35c3f15e7e
 
-# onnxruntime needs libgomp (OpenMP runtime); not in the base image by default.
-RUN dnf install -y libgomp && dnf clean all
+COPY requirements.txt ${LAMBDA_TASK_ROOT}/
+RUN pip install --no-cache-dir --only-binary=:all: -r "${LAMBDA_TASK_ROOT}/requirements.txt"
 
-# Writable/baked paths. /opt is read-only at runtime but writable at build time.
-ENV U2NET_HOME=/opt/models \
-    NUMBA_CACHE_DIR=/tmp \
-    MPLCONFIGDIR=/tmp
+ARG REMBG_MODEL=birefnet-general-lite
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Lambda can only write to /tmp, where numba keeps its cache. app.py loads REMBG_MODEL from U2NET_HOME.
+ENV REMBG_MODEL=${REMBG_MODEL} \
+    U2NET_HOME=/opt/models \
+    NUMBA_CACHE_DIR=/tmp
 
-# Pre-download BiRefNet weights into U2NET_HOME so they ship inside the image.
-RUN python -c "from rembg import new_session; new_session('birefnet-general-lite')" \
-    && chmod -R a+rX /opt/models
+# rembg's downloader writes the model with mode 0600, which Lambda's non-root user cannot read.
+RUN python -c "import os; from rembg import new_session; new_session(os.environ['REMBG_MODEL'])" \
+    && chmod -R a+rX "${U2NET_HOME}"
 
 COPY app.py ${LAMBDA_TASK_ROOT}/
 
-# Lambda handler entrypoint: <module>.<function>
 CMD ["app.handler"]

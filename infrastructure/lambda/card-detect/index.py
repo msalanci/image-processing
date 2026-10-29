@@ -3,24 +3,32 @@
 
 """Gate that decides whether an uploaded image is an AWS Builder Card.
 
-An S3 event on images/raw/ invokes this lambda, which scores the image with a CLIP ViT-B/32 encoder running on CPU through onnxruntime. 
-Likely cards are forwarded to the image-processor lambda for the full cleanup pipeline; 
-everything else is moved to images/rejected/ and reported by email. 
-The function errs toward forwarding, so a borderline score is still processed.
+An S3 event for a new .jpg under images/raw/ invokes this Lambda. It scores the image with a CLIP
+ViT-B/32 image encoder on CPU through onnxruntime, against label vectors that build_onnx.py computes
+at build time, so no PyTorch runs here. Likely and borderline AWS cards are forwarded to the
+image-processor Lambda; everything else is moved to images/rejected/ and reported by email. The gate
+is a function of its own because the image-processor's memory is already close to its limit.
+
+The default DROP_THRESHOLD of 0.20 sits in the measured gap between real AWS cards (0.31 to 0.87)
+and other cards or non-cards (at most 0.016). Scores between the two thresholds are still forwarded,
+so the gate errs toward processing. The encoder and the label vectors load once per container and
+warm invocations reuse them. HEIC and HEIF photos decode through pillow-heif, whose wheel bundles
+libheif; if it cannot be loaded, a warning is logged and the other formats still decode.
 
 Functions:
     handler: Entry point; scores each record and forwards or quarantines it.
     p_card: Returns the AWS-card and any-card probabilities for one image.
     preprocess_np: Resizes and normalises an image into the encoder's input tensor.
 
-Environment (set by Terraform):
+Environment (set by Terraform unless noted; the defaults in the code only matter for local runs):
     RAW_PREFIX                      (images/raw/) input prefix the function reads
     REJECTED_PREFIX                 (images/rejected/) quarantine prefix, a dead end
     IMAGE_PROCESSOR_FUNCTION_NAME   the processor lambda the function forwards to
     REJECT_TOPIC_ARN                SNS topic for reject notifications
-    KEEP_THRESHOLD / DROP_THRESHOLD the two score cutoffs (floats)
-    MODEL_DIR                       (/opt/model) where visual.onnx + text.npz live
-    AWS_REGION                      provided automatically by the Lambda runtime
+    REJECTED_TAB_URL                the review editor's Rejected tab, linked from the reject email
+    KEEP_THRESHOLD / DROP_THRESHOLD the two score cutoffs (floats, defaults 0.50 and 0.20)
+    MODEL_DIR                       (/opt/model) where visual.onnx, visual.onnx.data and
+                                    text.npz live; set by the Dockerfile, not by Terraform
 """
 
 import os
@@ -37,24 +45,23 @@ from PIL import Image
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# HEIC/HEIF decoding for Pillow 
 try:
     from pillow_heif import register_heif_opener
 
     register_heif_opener()
-except Exception as _heif_err:
+except Exception as _heif_err:  # pragma: no cover
     logger.warning("pillow-heif unavailable; HEIC/HEIF uploads will not decode: %s", _heif_err)
 
-# Every value below is set by Terraform
 RAW_PREFIX = os.environ.get("RAW_PREFIX", "images/raw/")
 REJECTED_PREFIX = os.environ.get("REJECTED_PREFIX", "images/rejected/")
 IMAGE_PROCESSOR_FUNCTION_NAME = os.environ.get("IMAGE_PROCESSOR_FUNCTION_NAME", "")
 REJECT_TOPIC_ARN = os.environ.get("REJECT_TOPIC_ARN", "")
+REJECTED_TAB_URL = os.environ.get("REJECTED_TAB_URL", "")
 
-# Re-submitted images carry this marker and skip scoring, so a wrongly rejected card can't be rejected twice (boto3 strips the x-amz-meta- prefix)
+# S3 lowercases user metadata keys and boto3 drops their x-amz-meta- prefix;
+# the review editor writes this same key.
 FORCE_PROCESS_META = "force-process"
 
-# Verdict tresholds
 KEEP_THRESHOLD = float(os.environ.get("KEEP_THRESHOLD", "0.50"))
 DROP_THRESHOLD = float(os.environ.get("DROP_THRESHOLD", "0.20"))
 
@@ -62,47 +69,41 @@ MODEL_DIR = os.environ.get("MODEL_DIR", "/opt/model")
 VISUAL_ONNX = os.path.join(MODEL_DIR, "visual.onnx")
 TEXT_NPZ = os.path.join(MODEL_DIR, "text.npz")
 
-# ViT-B/32 input resolution + CLIP normalisation constants
+# Must match the open_clip model that build_onnx.py exports, or the embeddings drift
+# from the PyTorch reference.
 IMAGE_SIZE = 224
 CLIP_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
 CLIP_STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
 
-# AWS clients
 s3 = boto3.client("s3")
 sns = boto3.client("sns")
-lambda_client = boto3.client("lambda")  # async-invokes the image-processor
+lambda_client = boto3.client("lambda")
 
-# Model artifacts
-# Load the ONNX image encoder + precomputed label vectors ONCE per container, reused across warm invocations
 _SESSION = ort.InferenceSession(VISUAL_ONNX, providers=["CPUExecutionProvider"])
 _INPUT_NAME = _SESSION.get_inputs()[0].name
 _TEXT = np.load(TEXT_NPZ, allow_pickle=True)
 _TEXT_EMBEDS = _TEXT["embeds"].astype(np.float32)
 _LOGIT_SCALE = float(_TEXT["logit_scale"])
-
-# Two label groups (build_onnx.py); ordering is [AWS..., competitor..., noncard...]
 _CARD_COUNT = int(_TEXT["card_count"])
-
-# aws_count: first N labels are AWS-specific
 _AWS_COUNT = int(_TEXT["aws_count"]) if "aws_count" in _TEXT else _CARD_COUNT
 
 
 def preprocess_np(pil_img, size=IMAGE_SIZE):
-    """
-    Turns an image into the input tensor the encoder expects.
+    """Turn an image into the encoder's input tensor, as open_clip's evaluation transform does.
 
-    Resizes, centre-crops to a square and normalises the pixels the same way open_clip does. 
-    The long edge must use int(), not round(), or the scores drift.
+    It replicates that transform bit-exactly without torchvision: a bicubic resize of the shorter
+    side, a centre crop and the CLIP mean/std normalisation. The long edge is truncated with int(),
+    not rounded, because that is what torchvision's Resize does; rounding makes the ONNX embeddings
+    drift from the PyTorch reference.
 
     Args:
-        pil_img: Input image as a PIL Image.
-        size: Target square resolution in pixels.
+        pil_img: Decoded input image as a PIL Image, any mode.
+        size: Target square resolution in pixels, matching the ViT-B/32 input size.
 
     Returns:
-        float32 array of shape (1, 3, size, size), ready for the encoder.
+        Contiguous float32 array of shape (1, 3, size, size), normalised and ready for the encoder.
     """
 
-    # Resize the shorter side to `size`, truncating the long edge
     img = pil_img.convert("RGB")
     w, h = img.size
     if w <= h:
@@ -111,81 +112,84 @@ def preprocess_np(pil_img, size=IMAGE_SIZE):
         nh, nw = size, int(w * size / h)
     img = img.resize((nw, nh), Image.BICUBIC)
 
-    # Centre-crop the resized image down to a square
     left, top = (nw - size) // 2, (nh - size) // 2
     img = img.crop((left, top, left + size, top + size))
 
-    # Scale to 0-1 and apply the CLIP mean/std normalisation
     x = np.asarray(img).astype(np.float32) / 255.0
     x = (x - CLIP_MEAN) / CLIP_STD
 
-    # Channel-first layout, wrapped as a batch of one
     x = np.transpose(x, (2, 0, 1))[None, ...]
     return np.ascontiguousarray(x, dtype=np.float32)
 
 
 def p_card(raw_bytes):
-    """
-    Scores an image and returns how likely it is an AWS Builder Card and a card at all.
+    """Score an image against the label set and return its AWS-card and any-card probabilities.
 
-    The encoder turns the image into a vector, which is compared against every label vector. 
-    A softmax makes all labels share one 100%, so a competitor label takes probability away from the AWS ones. 
-    The two scores are sums over the AWS labels alone and over the AWS plus competitor labels.
+    The image embedding is compared with every label vector in text.npz (cosine similarity times the
+    model's logit scale) and one softmax runs over all labels. Because the labels share that one
+    softmax, a competitor label pulls probability away from the AWS labels: that is what keeps
+    p_aws low for other card types. The softmax subtracts the row maximum first, so exp() cannot
+    overflow. build_onnx.py stores the labels in the order AWS, competitor, non-card, with the
+    group sizes as aws_count and card_count; a text.npz without aws_count makes p_aws equal
+    p_any_card.
 
     Args:
         raw_bytes: Encoded input image as downloaded from S3 (jpg/png/webp/bmp/tiff/heic).
 
     Returns:
         Tuple of (p_aws, p_any_card):
-            p_aws      Probability the image is an AWS Builder Card, and the only score the function decides on. 
-                       Low for other cards, which score on their own labels.
-            p_any_card Probability it is a card of any kind. 
-                       Never decides anything, only explains a rejection.
+            p_aws      Softmax mass over the AWS-specific labels — the AWS-ness score, and the
+                       value the gate actually decides on. LOW for non-AWS cards, because
+                       Pokemon/poker/sports land on their own competitor labels instead.
+            p_any_card Mass over the AWS and competitor labels together, i.e. "is this any kind
+                       of card at all?". Never gates; it only labels WHY something was rejected.
+
+    Raises:
+        PIL.UnidentifiedImageError: When the bytes are not an image format Pillow can decode.
     """
 
-    # Decode and preprocess into the encoder's expected tensor
     img = Image.open(io.BytesIO(raw_bytes))
     x = preprocess_np(img)
 
-    # Encode the image and normalise, so the dot product below is a cosine similarity
-    emb = _SESSION.run(None, {_INPUT_NAME: x})[0]          # (1, 512)
+    emb = _SESSION.run(None, {_INPUT_NAME: x})[0]
     emb = emb / np.linalg.norm(emb, axis=-1, keepdims=True)
 
-    # Compare against every label vector and scale by the model's learned temperature
-    logits = _LOGIT_SCALE * (emb @ _TEXT_EMBEDS.T)          # (1, num_labels)
+    logits = _LOGIT_SCALE * (emb @ _TEXT_EMBEDS.T)
 
-    # Numerically stable softmax: all labels compete for one shared 100%
     z = logits - logits.max(axis=-1, keepdims=True)
     e = np.exp(z)
     probs = (e / e.sum(axis=-1, keepdims=True))[0]
 
-    # Sum the mass over the two label groups the caller needs
     p_aws = float(probs[:_AWS_COUNT].sum())
     p_any_card = float(probs[:_CARD_COUNT].sum())
     return p_aws, p_any_card
 
 
 def _forward_to_processor(record):
-    """
-    Hands an accepted upload to the image-processor lambda for the full cleanup pipeline.
+    """Hand an accepted upload to the image-processor Lambda with an asynchronous invoke.
 
-    The record is wrapped back into an S3-shaped event, so the processor cannot tell it was not called by S3. 
-    The invoke is asynchronous: this function returns straight away instead of waiting out the minute-or-two run, and Lambda still retries a failure on its own.
-    A missing function name is logged instead of raised.
+    The record goes out unmodified, wrapped as a one-record S3 event, which is the shape the
+    processor's handler reads. The invoke is asynchronous, so the gate does not wait out the
+    60-180 second processing run, and Lambda's async retries apply as they would for S3 delivery.
+    A missing function name is logged rather than raised, so one misconfigured environment
+    variable cannot turn every upload into a failed invocation.
 
     Args:
-        record: A single S3 event record, forwarded unmodified so the processor cannot tell it was not invoked by S3 directly.
+        record: A single S3 event record, forwarded unmodified so the processor cannot tell it
+            was not invoked by S3 directly.
 
     Returns:
-        None.
+        None. Sends the asynchronous invoke, or logs an error when IMAGE_PROCESSOR_FUNCTION_NAME
+        is empty.
+
+    Raises:
+        botocore.exceptions.ClientError: When Lambda refuses the invoke.
     """
 
-    # Without the target function name there is nothing to forward to
     if not IMAGE_PROCESSOR_FUNCTION_NAME:
         logger.error("[CardDetect] IMAGE_PROCESSOR_FUNCTION_NAME not set — cannot forward")
         return
 
-    # Fire-and-forget: re-wrap the record as an S3-shaped event and invoke
     lambda_client.invoke(
         FunctionName=IMAGE_PROCESSOR_FUNCTION_NAME,
         InvocationType="Event",
@@ -194,11 +198,11 @@ def _forward_to_processor(record):
 
 
 def _quarantine(bucket, key):
-    """
-    Moves a rejected upload from the input prefix to the quarantine prefix.
+    """Move a rejected upload from the raw prefix to the rejected prefix, keeping its file name.
 
-    Nothing is triggered from the quarantine prefix.
-    S3 b ucket is versioned, so a wrongly rejected image can be put back later.
+    S3 has no move, so the object is copied and the original deleted. Nothing triggers on the
+    rejected prefix, so the upload is kept for inspection or for copying back to be processed after
+    all, and the versioned bucket keeps a recoverable version of the deleted original.
 
     Args:
         bucket: Name of the S3 bucket holding the upload.
@@ -206,12 +210,13 @@ def _quarantine(bucket, key):
 
     Returns:
         The new key under the rejected prefix, used in the notification email.
+
+    Raises:
+        botocore.exceptions.ClientError: When S3 refuses the copy or the delete.
     """
 
-    # Same file name, different prefix
     rejected_key = REJECTED_PREFIX + key[len(RAW_PREFIX):]
 
-    # S3 has no move operation, so copy to the new key and delete the original
     s3.copy_object(
         Bucket=bucket,
         Key=rejected_key,
@@ -222,12 +227,19 @@ def _quarantine(bucket, key):
 
 
 def _publish_reject(bucket, key, rejected_key, p):
-    """
-    Sends the maintainer an email explaining that an upload was auto-rejected.
+    """Email the maintainer that an upload was auto-rejected, with its score and where it was moved.
 
-    It has its own SNS topic, because a rejected upload has no card record to review. 
-    The email carries the score, both S3 locations and a CLI command to put the image back. 
-    Sending is best effort, so a failed email cannot fail the rejection.
+    It publishes to its own SNS topic rather than the pipeline's review topic, because a rejected
+    upload has no cardId, no finished image and no review page. The message carries the score, the
+    cutoff it missed, both S3 locations and the link to the review editor's Rejected tab. Recovery
+    goes through that tab's "Put to process" button rather than a plain move back to the raw prefix,
+    because only the button adds the force-process marker (a moved-back image is scored the same way
+    and rejected again) while keeping the upload's metadata. Sending is best effort, so a broken
+    notification cannot fail an otherwise correct rejection.
+
+    SNS refuses a Subject of 100 characters or more, and a file name can be over 100 characters
+    long (an event name of up to 60, the year and a UUID), so the file name in the Subject is cut
+    to keep it at 99; the full name is in the message.
 
     Args:
         bucket: Name of the S3 bucket holding the upload.
@@ -236,15 +248,14 @@ def _publish_reject(bucket, key, rejected_key, p):
         p: The AWS-card probability that fell below the drop cutoff.
 
     Returns:
-        None.
+        None. Publishes one message to REJECT_TOPIC_ARN; skips it when the topic is not set, and
+        logs a failed publish instead of raising.
     """
 
-    # No topic = no email
     if not REJECT_TOPIC_ARN:
         logger.info("[CardDetect] REJECT_TOPIC_ARN not set, skipping reject email")
         return
 
-    # Body
     name = key.split("/")[-1]
     message = f"""A Builder Card upload was auto-rejected by the card-detect gate.
 
@@ -260,45 +271,64 @@ Quarantined to: s3://{bucket}/{rejected_key}
 
 The image was NOT deleted — it was moved to the images/rejected/ prefix (the
 bucket is versioned, so it is recoverable). If this was a real card the gate got
-wrong, move it back into images/raw/ to reprocess it:
+wrong, open the review editor's Rejected tab and press "Put to process" next to
+it. That sends it back through the pipeline with its event, year and uploader,
+and marks it so the gate lets it through:
 
-  aws s3 mv s3://{bucket}/{rejected_key} s3://{bucket}/{key} --region {os.environ.get("AWS_REGION", "eu-central-1")}
+  {REJECTED_TAB_URL or "<review editor>/review?status=rejected"}
 """
-    # Failed email must never fail the gate
+    score = f" (P(AWS)={p:.2f})"
+    subject = f"Rejected upload: {name}"[:99 - len(score)] + score
     try:
         sns.publish(
             TopicArn=REJECT_TOPIC_ARN,
-            Subject=f"Rejected upload: {name} (P(AWS)={p:.2f})",
+            Subject=subject,
             Message=message,
         )
         logger.info("[CardDetect] reject email sent for %s", key)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - non-fatal
         logger.exception("[CardDetect] failed to send reject email: %s", e)
 
 
 def handler(event, context):
-    """
-    Lambda entry point: scores every uploaded image and either forwards or quarantines it.
+    """Lambda entry point: score every uploaded image and forward it or quarantine it.
 
-    An image scoring at or above the drop cutoff goes to the image-processor; 
-    below it, the image is quarantined and an email is sent. 
-    The keep cutoff changes nothing, it only labels a forward confident or unsure. 
-    A record that raises is logged and the rest still run.
+    Keys arrive URL-encoded in S3 event notifications, so they are decoded first. Records without a
+    bucket or key are skipped, and so are .keep placeholders, corner-overlay images and keys outside
+    the raw prefix, with the same guards as the image-processor, although the S3 notification
+    already filters on the raw prefix and the .jpg suffix.
+
+    An upload carrying the force-process marker, which the review editor's "put to process" sets on
+    a rejected image it sends back, is forwarded without scoring, because the identical image would
+    score the same and be rejected again; the marker is read before the body, so the model does not
+    run. Every other upload is forwarded when p_aws reaches DROP_THRESHOLD and quarantined with a
+    reject email below it; KEEP_THRESHOLD and p_any_card only choose the verdict label. A record
+    that raises is logged and recorded as an error, and the remaining records continue.
+
+    When any record failed, the function raises after the loop. S3 invokes it asynchronously, and
+    Lambda retries an asynchronous event only when the function fails, so returning normally would
+    leave a temporarily failed upload in the raw prefix for good. A retry is safe: the upload is still
+    under its raw key until it is forwarded or quarantined, and S3 sends one record per event.
 
     Args:
         event: S3 event notification; only its "Records" list is read.
         context: Lambda context object, unused.
 
     Returns:
-        Dict with statusCode 200 and a JSON body listing one result per record: 
-        the key, both scores, the verdict and the action taken, or the error.
+        HTTP-shaped dict with status 200, whose JSON body holds one result per record that was not
+        skipped: the key, the verdict ("forced", "aws-card", "aws-unsure", "non-aws-card" or
+        "not-a-card") and the action ("forwarded" or "rejected"). Scored records also carry p_aws
+        and, under the key "p_card", p_any_card. Every forwarded or rejected record is also logged as
+        one JSON line. An empty results list means no record was handled.
+
+    Raises:
+        RuntimeError: One or more records failed; the message lists their keys.
     """
 
     logger.info("[CardDetect] keep>=%.2f drop<%.2f", KEEP_THRESHOLD, DROP_THRESHOLD)
     results = []
 
     for record in event.get("Records", []):
-        # Unwrap the bucket and key from the S3 event record
         s3_info = record.get("s3", {})
         bucket = s3_info.get("bucket", {}).get("name")
         key = s3_info.get("object", {}).get("key")
@@ -306,10 +336,8 @@ def handler(event, context):
             logger.info("[CardDetect] missing bucket/key, skipping")
             continue
 
-        # S3 percent-encodes keys in event notifications
         key = urllib.parse.unquote_plus(key)
 
-        # Backup for the S3 suffix filter, so the function never scores its own by-products
         if key.endswith(".keep"):
             logger.info("[CardDetect] skipping .keep placeholder")
             continue
@@ -321,34 +349,27 @@ def handler(event, context):
             continue
 
         try:
-            # Fetch the object; metadata is read before the body so the bypass can skip scoring
             obj = s3.get_object(Bucket=bucket, Key=key)
 
-            # A re-submitted image is forwarded without scoring, so it cannot be rejected twice.
             if obj.get("Metadata", {}).get(FORCE_PROCESS_META):
                 _forward_to_processor(record)
                 logger.info(json.dumps({"key": key, "verdict": "forced", "action": "forwarded"}))
                 results.append({"key": key, "verdict": "forced", "action": "forwarded"})
                 continue
 
-            # Score the image: p_aws drives the decision, p_any only explains a rejection
             raw = obj["Body"].read()
             p_aws, p_any = p_card(raw)
 
-            # Real cards score ~0.3-0.9 and other cards ~0.00-0.02,cso the 0.20 cutoff sits in the gap between them.
             if p_aws >= DROP_THRESHOLD:
-                # Looks like an AWS card -> forward.
                 verdict = "aws-card" if p_aws >= KEEP_THRESHOLD else "aws-unsure"
                 _forward_to_processor(record)
                 action = "forwarded"
             else:
-                # Low AWS score -> quarantine to images/rejected/ + notify. .
                 verdict = "non-aws-card" if p_any >= DROP_THRESHOLD else "not-a-card"
                 rejected_key = _quarantine(bucket, key)
                 _publish_reject(bucket, key, rejected_key, p_aws)
                 action = "rejected"
 
-            # Structured log line on every invocation (observability).
             logger.info(json.dumps({
                 "key": key, "p_aws": round(p_aws, 4), "p_card": round(p_any, 4),
                 "verdict": verdict, "action": action,
@@ -357,8 +378,11 @@ def handler(event, context):
                 "key": key, "p_aws": round(p_aws, 4), "p_card": round(p_any, 4),
                 "verdict": verdict, "action": action,
             })
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - log and continue to next record
             logger.exception("[CardDetect] failed on %s: %s", key, e)
             results.append({"key": key, "status": "error", "error": str(e)})
 
+    failed = [r["key"] for r in results if r.get("status") == "error"]
+    if failed:
+        raise RuntimeError(f"{len(failed)} record(s) failed, raising so Lambda retries the event: {failed}")
     return {"statusCode": 200, "body": json.dumps({"results": results})}

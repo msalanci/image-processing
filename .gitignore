@@ -1,21 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Michal Salanci
 
-# hidden and obsolete files and folders
-~$*
-__pycache__
-.DS_Store
+# Deployer-specific values and Terraform state; terraform.tfvars.example is the published template
+*.tfvars
+!*.tfvars.example
+*.tfstate
+*.tfstate.*
+*.tfplan
 .terraform/
-.terraform.lock.hcl
-.terraform.tfstate.lock.info
-terraform.tfstate
-terraform.tfstate.backup
-.venv/
-links.txt
 
-# lambda artifacts - will be regenerated with the script - see README.md
+# Build outputs: the Lambda zips, and the card-detect model that build_onnx.py generates
+infrastructure/build/
 infrastructure/lambda/card-detect/onnx_out/
 
-# lambda zips - terraform's archive_file rebuilds these on every plan/apply
-infrastructure/build/
-
+# Local environments and caches
+.venv/
+__pycache__/
+*.pyc
+.DS_Store

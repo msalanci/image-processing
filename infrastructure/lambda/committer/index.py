@@ -1,32 +1,48 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Michal Salanci
+"""
+Committer Lambda (BuilderCardsCommitter): publishes an approved card to GitHub, or deletes a card
+everywhere.
 
-"""Publishes an approved card to the website, or removes a published one.
+It is the last step of the card pipeline and the only component that holds the GitHub token and the
+power to delete cards. The review editor invokes it synchronously (RequestResponse); it has no API
+Gateway and no other trigger. The editor holds only lambda:InvokeFunction on this function, so the
+internet-facing editor never sees the token and cannot delete anything itself. The payload is
+{"action": "publish" | "delete", "cardId": "..."}; every other value comes from the DynamoDB card
+table, the single source of truth.
 
-The review editor invokes this lambda synchronously with an action and a cardId, and nothing else: 
-every value that reaches GitHub or S3 is read here from DynamoDB. 
-Publishing re-checks that the card is approved, then commits its markdown page and image to the live branch in one commit, 
-so a page can never appear without its picture. 
-Deleting removes the card from GitHub first, then S3, then DynamoDB..
+- publish: re-checks that the card is approved, then commits <slug>.md (the Hugo front matter) and
+  <cardId>.png (the finished image from S3) in one commit, straight to the publish branch, which in
+  the single-branch setup is the branch Amplify builds. Returns {"published_url": "..."} or
+  {"error": "..."}.
+- delete, the per-card kill switch: removes the card's files from GitHub, then its S3 objects, then
+  its DynamoDB item, in that order so a failure part-way can be retried. Returns "deleted",
+  "removed" and "github", plus "github_skipped" and "s3_warnings" when they apply, or
+  {"error": "..."}.
 
-This function holds the GitHub token and has no API Gateway in front of it. 
-The review editor is on the internet but holds no token and cannot publish on its own.
+Environment variables:
+    GITHUB_PAT_SECRET_ARN: Secrets Manager ARN of the fine-grained GitHub token.
+    GITHUB_OWNER, GITHUB_REPO: The repository the site is built from.
+    GITHUB_PUBLISH_BRANCH: The branch both actions commit to; in the single-branch setup it is the
+        live branch that Amplify builds (master). It must already exist, because the Git Data API
+        does not create branches. Terraform always sets it; the default is only a fallback.
+    GITHUB_BASE_BRANCH: The live branch, equal to GITHUB_PUBLISH_BRANCH in the single-branch setup.
+        It is read, but no code in this file uses it.
+    GITHUB_CONTENT_DIR, GITHUB_IMAGE_DIR: Optional repository folders for the markdown pages and the
+        card images. Terraform does not set them, so the built-in defaults apply.
+    IMAGES_BUCKET: The private image bucket; publish reads the finished PNG from it, delete removes
+        the card's objects.
+    DDB_TABLE: The card table, read by both actions.
+    AWS_REGION: Set by the Lambda runtime.
 
-Functions:
-    handler: Entry point; dispatches on the action in the payload.
-    do_publish: Re-reads and re-verifies the card, then commits it.
-    do_delete: Removes the card from GitHub, S3 and DynamoDB.
+CARD_FIELDS are the card attributes copied into the front matter: the fields the review editor
+edits, except status. A new field reaches the site only when it is added both here and to
+build_front_matter().
 
-Environment (set by Terraform):
-    GITHUB_PAT_SECRET_ARN           Secrets Manager ARN of the fine-grained PAT
-    GITHUB_OWNER / GITHUB_REPO      the repository to commit to
-    GITHUB_PUBLISH_BRANCH           branch to commit and delete on (the live branch)
-    GITHUB_BASE_BRANCH              the live branch; same as the publish branch
-    GITHUB_CONTENT_DIR              where the markdown pages live
-    GITHUB_IMAGE_DIR                where the card images live
-    IMAGES_BUCKET                   private bucket holding the processed images
-    DDB_TABLE                       card table, the source of truth for both actions
-    AWS_REGION                      provided automatically by the Lambda runtime
+SLUG_MAX_LEN and SLUG_RE describe the only slugs this Lambda puts into a commit path: the shape
+the image-processor's slugify() produces (lowercase a-z and 0-9 groups joined by single hyphens),
+at most 100 characters long. They match the review editor's check; _slug_problem() says why the
+check is repeated here.
 """
 
 import os
@@ -44,11 +60,7 @@ REGION = os.environ.get("AWS_REGION", "eu-central-1")
 GITHUB_PAT_SECRET_ARN = os.environ.get("GITHUB_PAT_SECRET_ARN", "")
 GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
-
-# Commit and delete target; it must already exist, because the API will not create it
 GITHUB_PUBLISH_BRANCH = os.environ.get("GITHUB_PUBLISH_BRANCH", "master")
-
-# The live branch, which is the publish branch itself in this single-branch setup
 GITHUB_BASE_BRANCH = os.environ.get("GITHUB_BASE_BRANCH", "main")
 GITHUB_CONTENT_DIR = os.environ.get("GITHUB_CONTENT_DIR", "web/awsbuildercards/content/collectibles")
 GITHUB_IMAGE_DIR = os.environ.get("GITHUB_IMAGE_DIR", "web/awsbuildercards/static/cards")
@@ -59,14 +71,11 @@ secretsmanager = boto3.client("secretsmanager", region_name=REGION)
 s3 = boto3.client("s3", region_name=REGION)
 ddb = boto3.client("dynamodb", region_name=REGION)
 
-_github_token = None  # cached GitHub PAT after first Secrets Manager fetch
+_github_token = None
 
-# Card fields read from DynamoDB to build the front matter
 CARD_FIELDS = ["title", "slug", "weight", "event", "year", "effect",
                "description", "category", "subcategory", "uploader"]
 
-
-# The slug becomes a path in the commit
 SLUG_MAX_LEN = 100
 SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 
@@ -75,8 +84,9 @@ def _s(item, key):
     """
     Reads a string attribute out of a raw DynamoDB item.
 
-    The low-level client wraps every value in a type descriptor, so a string lives at item[key]["S"]. 
-    A missing item or attribute gives an empty string, not an error.
+    The low-level DynamoDB client returns every attribute wrapped in a type descriptor, so a string
+    lives at item[key]["S"]. This unwraps that safely and returns an empty string when the item is
+    None or the attribute is absent, so callers never have to guard each field individually.
 
     Args:
         item: Raw DynamoDB item dict as returned by get_item(), or None.
@@ -92,16 +102,30 @@ def _slug_problem(slug):
     """
     Validates that a slug is safe to interpolate into a GitHub commit path.
 
-    Bad slugs are rejected rather than cleaned up, because a cleaned slug would be committed under one name while 
-    DynamoDB kept another, leaving a card that cannot be deleted.
-    fullmatch() is required here, since "$" would also match before a trailing newline.
+    The slug becomes a path component in both publish_to_github() and do_delete(), and the Git Data
+    API takes that path raw, so an unchecked value such as "../../x" can commit a file anywhere in
+    the repository, on the branch Amplify builds, which amounts to code execution at build time.
+    urllib.parse.quote() in _gh_exists() is no protection: its default safe="/" and the unreserved
+    "." let such a path through unchanged.
+    The review editor runs the same check, but it is repeated here, at the sink: this function holds
+    the GitHub token, trusts neither its caller nor DynamoDB, and a stored row can hold a slug that
+    never passed the editor's check.
+    The check requires a non-empty string within the length limit whose shape matches exactly
+    what the image-processor's slugify() produces: lowercase alphanumeric groups joined by single
+    hyphens.
+    This uses fullmatch() rather than match() with an anchored pattern, because "$" also matches
+    immediately BEFORE a trailing newline — re.match(r"^[a-z0-9-]+$", "aws-card\\n") would pass.
+    Bad slugs are REJECTED rather than sanitized on purpose: sanitizing would commit
+    <sanitized>.md while DynamoDB kept the raw value, so do_delete would later build a different
+    path, _gh_exists would miss it, and a live card would become un-deletable after its database
+    row had already been removed.
 
     Args:
         slug: Candidate slug string, as read from DynamoDB.
 
     Returns:
-        Empty string if the slug is safe, otherwise a human-readable reason describing the problem, 
-        suitable for logging and returning to the caller.
+        Empty string if the slug is safe, otherwise a human-readable reason describing the
+        problem, suitable for logging and returning to the caller.
     """
     if not slug:
         return "slug is empty"
@@ -115,23 +139,28 @@ def _slug_problem(slug):
 
 def _get_github_token():
     """
-    Fetches the GitHub personal access token from Secrets Manager.
+    Fetches the GitHub fine-grained personal access token from Secrets Manager.
 
-    Cached for the life of the container, so a warm invocation does not fetch it again.
+    The token is cached in a module-level global after the first call, so a warm container reuses
+    it across invocations instead of paying a Secrets Manager round trip per API call; a rotated
+    token is therefore picked up only by a new container. This Lambda is the only component in the
+    stack that holds the PAT — the internet-facing review editor never receives it and can only
+    invoke this function.
 
     Args:
         None. The secret ARN comes from the GITHUB_PAT_SECRET_ARN environment variable.
 
     Returns:
         The PAT as a stripped string.
+
+    Raises:
+        botocore.exceptions.ClientError: The secret could not be read.
     """
     global _github_token
 
-    # Warm container: reuse the token already fetched
     if _github_token is not None:
         return _github_token
 
-    # Cold start: fetch once and cache for the life of the container
     resp = secretsmanager.get_secret_value(SecretId=GITHUB_PAT_SECRET_ARN)
     _github_token = resp["SecretString"].strip()
     return _github_token
@@ -141,19 +170,28 @@ def _gh(method, path, body=None):
     """
     Makes a single authenticated call to the GitHub REST API.
 
-    Built on urllib, so the deployment package needs no dependencies. 
-    HTTP errors come back as a status code instead of an exception, because a 404 is a normal answer here.
+    The request is built with urllib rather than a third-party HTTP client, so the deployment
+    package stays dependency-free. Every call carries the token, the API version pin and a
+    User-Agent header, with a 15-second timeout on each network operation. HTTP error responses
+    are returned like any other result rather than raised, because callers branch on status codes
+    — a 404 from an existence check is a normal answer, not a failure. Nothing in this module
+    catches the exceptions below, so they end the invocation.
 
     Args:
         method: HTTP verb, e.g. "GET", "POST" or "PATCH".
         path: API path beginning with a slash, appended to https://api.github.com.
-        body: Optional dict serialised as the JSON request body.
+        body: Optional dict serialised as the JSON request body; None sends no body.
 
     Returns:
-        Tuple of (status_code, parsed_json) where the second element is None for empty or unparseable responses.
+        Tuple of (status_code, parsed_json). The second element is None for an empty body, or for
+        an error response whose body is not JSON.
+
+    Raises:
+        urllib.error.URLError, TimeoutError: GitHub could not be reached or did not answer in time.
+        json.JSONDecodeError: A success response's body is not JSON.
+        botocore.exceptions.ClientError: The token could not be read from Secrets Manager.
     """
 
-    # Build the request; only attach a body and content type when one was given
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(f"https://api.github.com{path}", method=method, data=data)
     req.add_header("Authorization", f"Bearer {_get_github_token()}")
@@ -162,8 +200,6 @@ def _gh(method, path, body=None):
     req.add_header("User-Agent", "buildercards-committer-lambda")
     if data is not None:
         req.add_header("Content-Type", "application/json")
-
-    # Return HTTP errors as values, not exceptions — callers branch on the status code
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
             payload = r.read()
@@ -180,20 +216,23 @@ def _gh(method, path, body=None):
 def _yaml_dq(value):
     """
     Renders a string as a double-quoted YAML scalar for the Hugo front matter.
-    Quotes, tabs and newlines are escaped, so card text cannot break out of its scalar and corrupt the front matter.
+
+    Backslashes are escaped first, so the backslashes added for double quotes, line breaks and tabs
+    are not escaped again. Line endings are normalised and, along with tabs, replaced by their
+    escape sequences, so a multi-line card description cannot break out of its quoted scalar and
+    corrupt the front-matter block. Other control characters are not escaped.
 
     Args:
         value: Raw string to quote, or None.
 
     Returns:
-        The value wrapped in double quotes with all special characters escaped.
+        The value wrapped in double quotes, with backslashes, double quotes, line breaks and tabs
+        escaped; None or an empty string gives "".
     """
 
-    # Backslashes first, so the escapes added below are not themselves escaped
     s = value or ""
     s = s.replace("\\", "\\\\").replace('"', '\\"')
 
-    # Normalise line endings, then flatten newlines and tabs into escape sequences
     s = s.replace("\r\n", "\n").replace("\r", "\n")
     s = s.replace("\n", "\\n").replace("\t", "\\t")
     return f'"{s}"'
@@ -203,27 +242,29 @@ def build_front_matter(card_id, values):
     """
     Builds the Hugo front-matter block that becomes the card's markdown page.
 
-    Weight and year stay unquoted so Hugo reads them as numbers, and the image path uses the cardId, 
-    so renaming a card never breaks its picture. The page has no body content.
+    Every text field is passed through _yaml_dq() so card text cannot break the YAML, while weight
+    and year are emitted unquoted because Hugo needs them as numbers; they are written as stored,
+    and only the review editor checks them, accepting digits or an empty value. An empty category
+    becomes "collectibles". The uploader is rendered as a YAML list — one entry when a name was
+    given, empty otherwise. The image path is keyed by the stable cardId rather than the slug, so
+    renaming a card never breaks its picture. This produces ONLY the front matter; the card has no
+    body content.
 
     Args:
         card_id: Stable card identifier, used to build the /cards/<cardId>.png image path.
         values: Dict of card fields read from DynamoDB (title, slug, weight, event, year, effect,
-                description, category, subcategory, uploader).
+            description, category, subcategory, uploader).
 
     Returns:
         The complete front-matter block as a string, delimited by --- lines and newline-terminated.
     """
 
-    # Uploader is a YAML list: one entry when present, empty list otherwise
     uploader_val = (values.get("uploader", "") or "").strip()
     uploader_line = f"uploader: [{_yaml_dq(uploader_val)}]" if uploader_val else "uploader: []"
 
-    # Numeric fields stay unquoted so Hugo reads them as numbers, not strings
     year = (values.get("year", "") or "").strip()
     weight = (values.get("weight", "") or "").strip()
 
-    # Assemble the block; every free-text field goes through the YAML quoter
     fm_lines = [
         "---",
         f"title: {_yaml_dq(values.get('title', ''))}",
@@ -245,7 +286,15 @@ def build_front_matter(card_id, values):
 def _gh_commit_files(repo, branch, files, message):
     """
     Commits several files to a branch atomically, in a single commit.
-    The Contents API can only write one file per commit.
+
+    This uses the Git Data API rather than the Contents API, because the Contents API can only
+    write one file per commit — which would put the markdown and its image in two separate commits
+    and leave a window where the site references a picture that does not exist yet. Each file is
+    uploaded as a blob, and the branch reference moves only once, at the very end, so either every
+    file lands together or nothing changes at all. The new tree is built on the branch's current
+    tree (base_tree), so every file not listed stays as it is; without it the commit would delete
+    the rest of the repository. The final update is a non-forced patch, so a concurrent push is
+    rejected rather than overwritten.
 
     Args:
         repo: Repository API path fragment, e.g. "/repos/<owner>/<repo>".
@@ -254,10 +303,10 @@ def _gh_commit_files(repo, branch, files, message):
         message: Commit message.
 
     Returns:
-        Tuple of (commit_html_url, "") on success, or ("", error_string) on any failure.
+        Tuple of (commit_html_url, "") on success, where the URL is empty if GitHub sent none, or
+        ("", error_string) when an API call answers with an unexpected status or body.
     """
 
-    # Find the branch tip and the tree it points at
     code, ref = _gh("GET", f"{repo}/git/ref/heads/{branch}")
     if code != 200 or not isinstance(ref, dict):
         return "", f"get branch ref failed (HTTP {code}) — does '{branch}' exist?"
@@ -268,7 +317,6 @@ def _gh_commit_files(repo, branch, files, message):
         return "", f"get base commit failed (HTTP {code})"
     base_tree_sha = base_commit["tree"]["sha"]
 
-    # Upload every file as a blob and collect the tree entries
     tree = []
     for path, content_b64 in files:
         code, blob = _gh("POST", f"{repo}/git/blobs", {"content": content_b64, "encoding": "base64"})
@@ -276,12 +324,10 @@ def _gh_commit_files(repo, branch, files, message):
             return "", f"create blob failed for {path} (HTTP {code})"
         tree.append({"path": path, "mode": "100644", "type": "blob", "sha": blob["sha"]})
 
-    # Build a new tree on top of the base tree, so untouched files are preserved
     code, new_tree = _gh("POST", f"{repo}/git/trees", {"base_tree": base_tree_sha, "tree": tree})
     if code != 201 or not isinstance(new_tree, dict):
         return "", f"create tree failed (HTTP {code})"
 
-    # Create the commit object pointing at that tree
     code, new_commit = _gh("POST", f"{repo}/git/commits", {
         "message": message,
         "tree": new_tree["sha"],
@@ -290,7 +336,6 @@ def _gh_commit_files(repo, branch, files, message):
     if code != 201 or not isinstance(new_commit, dict):
         return "", f"create commit failed (HTTP {code})"
 
-    # Move the branch: the single step that makes everything above visible
     code, _ = _gh("PATCH", f"{repo}/git/refs/heads/{branch}", {"sha": new_commit["sha"], "force": False})
     if code != 200:
         return "", f"update branch ref failed (HTTP {code})"
@@ -302,8 +347,15 @@ def publish_to_github(card_id, values, finished_key=""):
     """
     Commits a card's markdown page and its image to the publish branch in one commit.
 
-    The image is required: if it cannot be read the publish fails, so no page ever points at a missing picture. 
-    Changing a card's slug and re-publishing orphans the old markdown file, which has to be deleted by hand.
+    The slug is validated before it is used anywhere, because it is interpolated straight into the
+    commit path. The front matter is built and base64-encoded, the finished PNG is read from the
+    private S3 bucket, and both are committed together atomically. The image is REQUIRED — if it
+    cannot be read the whole publish fails, so the site never ends up with a markdown page pointing
+    at a missing picture. The markdown is named by slug while the image is named by the stable
+    cardId, which is why the front matter points at /cards/<cardId>.png.
+    Note on slug changes: changing a card's slug and re-publishing creates a new <newslug>.md and
+    orphans the old one, which has to be deleted by hand. The PNG is keyed by cardId, so it always
+    overwrites in place.
 
     Args:
         card_id: Stable card identifier, used for the image filename.
@@ -311,14 +363,14 @@ def publish_to_github(card_id, values, finished_key=""):
         finished_key: S3 key of the processed PNG; publishing fails if empty.
 
     Returns:
-        Tuple of (published_url, None) on success, or (None, error_string) on any failure.
+        Tuple of (published_url, None) on success, where published_url is the page's GitHub file
+        URL on the publish branch; or (None, error_string) when GitHub is not configured, the slug
+        is unsafe, the image cannot be read or the commit fails.
     """
 
-    # Nothing to do without GitHub configuration
     if not (GITHUB_PAT_SECRET_ARN and GITHUB_OWNER and GITHUB_REPO):
         return None, "GitHub not configured"
 
-    # Validate the slug BEFORE it is interpolated into a commit path
     slug = (values.get("slug", "") or "").strip()
     problem = _slug_problem(slug)
     if problem:
@@ -328,10 +380,8 @@ def publish_to_github(card_id, values, finished_key=""):
     repo = f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
     branch = GITHUB_PUBLISH_BRANCH
 
-    # Build the markdown page from the card's fields
     md_b64 = base64.b64encode(build_front_matter(card_id, values).encode("utf-8")).decode()
 
-    # The image is mandatory: never publish a page whose picture is missing
     if not finished_key:
         return None, "card has no finishedKey (no image to publish)"
     if not IMAGES_BUCKET:
@@ -342,7 +392,6 @@ def publish_to_github(card_id, values, finished_key=""):
     except Exception as ex:  # noqa: BLE001
         return None, f"read finished image failed: {ex}"
 
-    # Markdown named by slug, image named by cardId — both in one atomic commit
     files = [
         (f"{GITHUB_CONTENT_DIR}/{slug}.md", md_b64),
         (f"{GITHUB_IMAGE_DIR}/{card_id}.png", img_b64),
@@ -362,28 +411,30 @@ def do_publish(card_id):
     """
     Publish action: re-reads the card from DynamoDB, re-verifies approval, then commits it.
 
-    Approval is checked here rather than trusted from the request, so a caller cannot publish a card nobody approved. 
-    That check is what lets the review editor sit on the internet.
+    The caller only supplies a cardId — every value that ends up on the site is read here from
+    DynamoDB, which is the single source of truth. The status is re-checked against "approved"
+    rather than trusted from the request, so a caller cannot publish a card the human never
+    approved. This re-verification is the reason the review editor can be internet-facing without
+    holding any publishing power itself.
 
     Args:
         card_id: Identifier of the card to publish.
 
     Returns:
         Dict with "published_url" on success, or "error" describing why it was refused or failed.
+        On success the card is committed to the publish branch. A failed publish and a success are
+        logged; a missing or unapproved card is only reported in the returned dict.
     """
 
-    # Read the card; the caller's own content is never used
     resp = ddb.get_item(TableName=DDB_TABLE, Key={"cardId": {"S": card_id}})
     item = resp.get("Item")
     if not item:
         return {"error": f"card {card_id} not found"}
 
-    # Re-verify approval here — the human gate is enforced at this sink
     status = _s(item, "status")
     if status != "approved":
         return {"error": f"card {card_id} not approved (status={status!r})"}
 
-    # Collect the publishable fields and the image key
     values = {f: _s(item, f) for f in CARD_FIELDS}
     finished_key = _s(item, "finishedKey")
 
@@ -395,12 +446,14 @@ def do_publish(card_id):
     return {"published_url": url or ""}
 
 
-# DELETE
-
 def _corners_key(raw_key):
     """
-    Derives the key of the debug corners-overlay image the image-processor wrote.
-    Mirrors the processor's naming, so the overlay is deleted with the card instead of being left behind in the bucket.
+    Derives the key of the debug corners-overlay image that the image-processor may have written.
+
+    The processor saves a diagnostic overlay next to a raw upload when it finds the card and its
+    outline, named by stripping the original extension and appending a fixed suffix. This mirrors
+    that naming exactly so the overlay is cleaned up along with the card, instead of being orphaned
+    in the bucket.
 
     Args:
         raw_key: S3 key of the original upload, or an empty string.
@@ -411,7 +464,6 @@ def _corners_key(raw_key):
     if not raw_key:
         return ""
 
-    # Strip the extension, if any, and append the overlay suffix
     base = raw_key.rsplit(".", 1)[0] if "." in raw_key else raw_key
     return f"{base}__corners.png"
 
@@ -419,32 +471,41 @@ def _corners_key(raw_key):
 def _delete_s3(key):
     """
     Deletes a single S3 object, best effort.
-    The bucket is versioned, so the object stays recoverable, and deleting a missing key is a no-op. 
-    Errors are returned instead of raised, so one bad object is a warning, not a failure.
+
+    The bucket is versioned, so this writes a delete marker rather than destroying data — the
+    object stays recoverable. Deleting a key that does not exist is a successful no-op, because
+    DeleteObject is idempotent, which means a retried delete never fails on already-removed
+    objects. Errors are returned as strings rather than raised, so one failed object becomes a
+    warning instead of aborting the whole deletion.
 
     Args:
         key: S3 key to delete; an empty key is treated as nothing to do.
 
     Returns:
-        Empty string on success or when there was nothing to delete, otherwise an error string prefixed with the key.
+        Empty string on success or when there was nothing to delete; otherwise an error string,
+        either the key followed by the error or "IMAGES_BUCKET not configured".
     """
     if not key:
         return ""
     if not IMAGES_BUCKET:
         return "IMAGES_BUCKET not configured"
 
-    # Versioned bucket: this writes a delete marker, so the object stays recoverable
     try:
         s3.delete_object(Bucket=IMAGES_BUCKET, Key=key)
         return ""
-    except Exception as ex:
+    except Exception as ex:  # noqa: BLE001
         return f"{key}: {ex}"
 
 
 def _gh_exists(repo, branch, path):
     """
     Checks whether a file currently exists on a branch.
-    Called before a delete commit is built, because asking Git to remove a path that is not there fails the whole commit.
+
+    Used before building a delete commit, so only files that are actually present are included —
+    a pending card that was never published has none, and asking Git to remove a non-existent path
+    would fail the whole commit. Only 200 means present and only 404 means absent. Any other answer
+    (an expired or wrong token, a rate limit, an outage) is an error, because treating it as absent
+    would let the delete go on to remove the card's images and record while it stays on the site.
 
     Args:
         repo: Repository API path fragment, e.g. "/repos/<owner>/<repo>".
@@ -452,18 +513,26 @@ def _gh_exists(repo, branch, path):
         path: Repository-relative file path.
 
     Returns:
-        True if the file exists on that branch, False otherwise.
+        Tuple of (exists, error): (True, "") for 200, (False, "") for 404, and (False, error_string)
+        for any other status.
     """
     code, _ = _gh("GET", f"{repo}/contents/{urllib.parse.quote(path)}?ref={branch}")
-    return code == 200
+    if code == 200:
+        return True, ""
+    if code == 404:
+        return False, ""
+    return False, f"existence check for {path} failed (HTTP {code})"
 
 
 def _gh_delete_files(repo, branch, paths, message):
     """
     Removes several files from a branch atomically, in a single commit.
 
-    The mirror of _gh_commit_files(), except the tree entries carry a null sha, which is how the API expresses a deletion. 
-    A card that was never published produces no commit at all.
+    The mirror image of _gh_commit_files(), without blobs: each tree entry carries a null sha,
+    which is how the Git Data API expresses a deletion. Paths are filtered through _gh_exists()
+    first, so a never-published card produces no commit at all rather than an error. As with
+    publishing, the new tree is built on the current one and the branch reference moves only once
+    at the end, so the markdown and its image disappear from the site together.
 
     Args:
         repo: Repository API path fragment, e.g. "/repos/<owner>/<repo>".
@@ -472,16 +541,21 @@ def _gh_delete_files(repo, branch, paths, message):
         message: Commit message.
 
     Returns:
-        Tuple of (commit_html_url, "") on success, ("", "") when there was nothing to delete, or
-        ("", error_string) on failure.
+        Tuple of (commit_html_url, "") on success, ("", "") when _gh_exists() finds none of the
+        paths, or ("", error_string) when an existence check or another API call answers with an
+        unexpected status or body.
     """
 
-    # Only delete what is actually there; a never-published card has nothing
-    existing = [p for p in paths if _gh_exists(repo, branch, p)]
+    existing = []
+    for p in paths:
+        found, err = _gh_exists(repo, branch, p)
+        if err:
+            return "", err
+        if found:
+            existing.append(p)
     if not existing:
-        return "", ""  # nothing published to remove
+        return "", ""
 
-    # Find the branch tip and the tree it points at
     code, ref = _gh("GET", f"{repo}/git/ref/heads/{branch}")
     if code != 200 or not isinstance(ref, dict):
         return "", f"get branch ref failed (HTTP {code}) — does '{branch}' exist?"
@@ -492,13 +566,11 @@ def _gh_delete_files(repo, branch, paths, message):
         return "", f"get base commit failed (HTTP {code})"
     base_tree_sha = base_commit["tree"]["sha"]
 
-    # A null sha on a tree entry is how the Git Data API expresses "delete this path"
     tree = [{"path": p, "mode": "100644", "type": "blob", "sha": None} for p in existing]
     code, new_tree = _gh("POST", f"{repo}/git/trees", {"base_tree": base_tree_sha, "tree": tree})
     if code != 201 or not isinstance(new_tree, dict):
         return "", f"create tree failed (HTTP {code})"
 
-    # Create the commit object pointing at the reduced tree
     code, new_commit = _gh("POST", f"{repo}/git/commits", {
         "message": message,
         "tree": new_tree["sha"],
@@ -507,7 +579,6 @@ def _gh_delete_files(repo, branch, paths, message):
     if code != 201 or not isinstance(new_commit, dict):
         return "", f"create commit failed (HTTP {code})"
 
-    # Move the branch: the single step that takes the card off the live site
     code, _ = _gh("PATCH", f"{repo}/git/refs/heads/{branch}", {"sha": new_commit["sha"], "force": False})
     if code != 200:
         return "", f"update branch ref failed (HTTP {code})"
@@ -519,15 +590,33 @@ def do_delete(card_id):
     """
     Delete action: removes a card from GitHub, then S3, then DynamoDB.
 
+    The order is deliberate and makes a partial failure retryable. GitHub goes first, because that
+    is what takes a live card off the public site; if it fails the function aborts with the record
+    still intact, so the same delete can simply be run again. S3 objects follow as soft deletes on
+    the versioned bucket, and their failures are collected as warnings rather than treated as
+    fatal. The DynamoDB item is removed LAST, guarded by attribute_exists, because it is the record
+    that lets everything else be found — deleting it first would strand any remaining files.
+    The GitHub step runs only for a card with a slug, and only when GitHub is configured; a pending
+    card with an empty slug has nothing on GitHub. A card without a finishedKey falls back to
+    images/finished/<cardId>.png.
+    An unsafe slug is never put into a delete path either, because this is the same path-traversal
+    sink as publish. Unlike publish, it skips only the GitHub step and still clears S3 and DynamoDB
+    instead of aborting: publish_to_github() rejects the same slugs, so a validating committer
+    cannot have committed such a card, while refusing here would make the kill switch unusable for
+    exactly the records most worth removing. The skip is logged and returned as github_skipped, so
+    a stale page committed without this check gets noticed and removed by hand.
+
     Args:
         card_id: Identifier of the card to remove.
 
     Returns:
-        Dict with "deleted", "removed" (what was actually removed), "github" (commit URL), plus
-        optional "github_skipped" and "s3_warnings" keys; or "error" if the deletion was aborted.
+        Dict with "deleted" (the cardId), "removed" (labels of the steps that succeeded), "github"
+        (the delete commit URL, empty when nothing was removed from GitHub), plus "github_skipped"
+        (the slug problem) and "s3_warnings" when they apply; or "error" if the deletion was
+        aborted. A skipped GitHub step, a GitHub or DynamoDB failure and a success are logged; a
+        missing or vanished card is only reported in the returned dict.
     """
 
-    # Read the card to find everything that belongs to it
     resp = ddb.get_item(TableName=DDB_TABLE, Key={"cardId": {"S": card_id}})
     item = resp.get("Item")
     if not item:
@@ -541,13 +630,11 @@ def do_delete(card_id):
     removed = []
     github_url = ""
 
-    # An unsafe slug skips the GitHub step but still deletes the rest, so the kill switch
     slug_problem = _slug_problem(slug) if slug else ""
     if slug_problem:
         print(f"[committer] SKIPPING github delete for {card_id}: {slug_problem}: "
               f"{slug!r} — check for a stale .md by hand")
 
-    # 1. GitHub first, to take the card off the site; only published cards have a slug
     if slug and not slug_problem and GITHUB_PAT_SECRET_ARN and GITHUB_OWNER and GITHUB_REPO:
         repo = f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
         paths = [f"{GITHUB_CONTENT_DIR}/{slug}.md", f"{GITHUB_IMAGE_DIR}/{card_id}.png"]
@@ -560,7 +647,6 @@ def do_delete(card_id):
         if github_url:
             removed.append("github:md+png")
 
-    # 2. S3 objects (soft deletes; missing = ignored). Warnings, not fatal
     s3_errors = []
     for label, key in (("finished", finished), ("raw", raw_key), ("corners", corners)):
         err = _delete_s3(key)
@@ -569,7 +655,6 @@ def do_delete(card_id):
         elif key:
             removed.append(f"s3:{label}")
 
-    # 3. DynamoDB item LAST (guarded)
     try:
         ddb.delete_item(
             TableName=DDB_TABLE,
@@ -596,8 +681,13 @@ def handler(event, context):
     """
     Lambda entry point: dispatches to the publish or delete action.
 
-    Only the action and the cardId are taken from the caller; everything else is read from DynamoDB. 
-    An unknown action is refused rather than defaulted to anything.
+    This function has no API Gateway in front of it — it is invoke-only, called synchronously by
+    the review editor, which holds nothing but permission to invoke it. That is what keeps the
+    GitHub token out of the internet-facing component. The payload carries only an action and a
+    cardId; the cardId must name an existing item, and every other value that reaches GitHub or S3
+    is read from DynamoDB by the action itself, so caller-supplied content is never trusted. An
+    unrecognised action is refused rather than defaulted to anything. Errors the actions do not
+    catch end the synchronous invocation with a function error instead of a returned dict.
 
     Args:
         event: Invocation payload with "action" ("publish" or "delete") and "cardId".
@@ -606,15 +696,17 @@ def handler(event, context):
     Returns:
         Whatever the dispatched action returns, or a dict with "error" for a missing cardId or an
         unknown action.
+
+    Raises:
+        urllib.error.URLError, TimeoutError: GitHub could not be reached or did not answer in time.
+        botocore.exceptions.ClientError: The token or the card could not be read.
     """
 
-    # Only the action and the id are taken from the caller
     action = (event or {}).get("action", "")
     card_id = (event or {}).get("cardId", "")
     if not card_id:
         return {"error": "missing cardId"}
 
-    # Dispatch; anything unrecognised is refused rather than guessed at
     if action == "publish":
         return do_publish(card_id)
     if action == "delete":

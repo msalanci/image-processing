@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Michal Salanci
-
-__pycache__
-*.pyc
-README.md
-build_onnx.py
-build_onnx-requirements.txt
-.venv
+#
+# Build context for the card-detect image: only the files the Dockerfile copies.
+*
+!requirements.txt
+!index.py
+!onnx_out/visual.onnx
+!onnx_out/visual.onnx.data
+!onnx_out/text.npz

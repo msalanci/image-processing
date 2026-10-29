@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Michal Salanci
 #
-# The images bucket, its hardening, and the notification that starts the pipeline.
+# The images bucket: raw uploads, finished card images and rejected uploads under their
+# key prefixes, in one private, versioned and encrypted bucket. It also holds the CORS
+# rule for the browser upload form and the S3 trigger of the card-detect gate.
 
 resource "aws_s3_bucket" "images" {
   bucket = var.images_bucket_name
@@ -53,11 +55,15 @@ resource "aws_s3_bucket_notification" "images" {
 
   lambda_function {
     lambda_function_arn = aws_lambda_function.card_detect.arn
-    events              = ["s3:ObjectCreated:*"]
-    filter_prefix       = var.raw_prefix
-    filter_suffix       = ".jpg"
+    # Browser uploads arrive as s3:ObjectCreated:Post (presigned POST) and the review
+    # editor's re-submit as :Put; a narrower filter silently skips them. The .jpg suffix
+    # stops the processor's <stem>__corners.png overlay in raw/ from re-triggering.
+    events        = ["s3:ObjectCreated:*"]
+    filter_prefix = var.raw_prefix
+    filter_suffix = ".jpg"
   }
 
+  # S3 validates the Lambda invoke permission when it saves the notification.
   depends_on = [
     aws_lambda_permission.card_detect_s3,
   ]
@@ -71,7 +77,7 @@ resource "aws_s3_bucket_policy" "images" {
       {
         Sid       = "AllowAccountReadFinished"
         Effect    = "Allow"
-        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" }
+        Principal = { AWS = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:root" }
         Action    = "s3:GetObject"
         Resource  = "${aws_s3_bucket.images.arn}/${var.finished_prefix}*"
       }

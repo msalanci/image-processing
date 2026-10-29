@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Michal Salanci
 #
-# Two HTTP APIs: the public one that hands out upload URLs, and the admin one serving the review editor.
+# The two HTTP APIs: the public, unauthenticated upload API (POST /get-upload-url) and the
+# review editor's admin API (/review routes), kept apart for a smaller blast radius. The admin
+# API is locked by the editor's Basic Auth and CSRF check, not by its URL, and needs no CORS
+# because its pages are same-origin. Every route is throttled at its stage to a rate for a few
+# human users, so excess requests get 429 at the gateway without invoking the Lambda.
 
 resource "aws_apigatewayv2_api" "upload" {
   name          = "BuilderCardsUploadApi"
@@ -32,10 +36,10 @@ resource "aws_apigatewayv2_stage" "default" {
   name        = "$default"
   auto_deploy = true
 
-  # route_settings name a route by string, which creates no implicit dependency.
+  # route_settings name the route by its key string, which gives Terraform no dependency on the
+  # route; without this the stage can be created first and fail with NotFoundException.
   depends_on = [aws_apigatewayv2_route.upload]
 
-  # This endpoint is public and unauthenticated, so excess requests get a 429 at the gateway without ever invoking the lambda
   route_settings {
     route_key              = "POST /get-upload-url"
     throttling_rate_limit  = 5
@@ -43,11 +47,9 @@ resource "aws_apigatewayv2_stage" "default" {
   }
 }
 
-# A separate API for the review editor
 resource "aws_apigatewayv2_api" "admin" {
   name          = "BuilderCardsAdminApi"
   protocol_type = "HTTP"
-  # No CORS, because these pages are server-rendered and same-origin
 }
 
 resource "aws_apigatewayv2_integration" "review" {
@@ -109,6 +111,9 @@ resource "aws_apigatewayv2_stage" "admin" {
   api_id      = aws_apigatewayv2_api.admin.id
   name        = "$default"
   auto_deploy = true
+
+  # route_settings name the routes by their key strings, which gives Terraform no dependency on
+  # the routes; without this the stage can be created first and fail with NotFoundException.
   depends_on = [
     aws_apigatewayv2_route.review_list,
     aws_apigatewayv2_route.review_edit,

@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Michal Salanci
 #
-# Three SNS topics and their email subscriptions: 
-# - a card to review
-# - a deploy result
-# - a rejected upload
+# SNS topics that email the maintainer, each with one email subscription: new uploads
+# to review (SNS1, published by the image-processor), Amplify deploy results (SNS3, by
+# the EventBridge rule) and auto-rejected uploads (SNS4, by the card-detect gate).
+# Email subscriptions cannot be confirmed automatically: each new one stays pending until
+# the maintainer clicks the link in AWS's confirmation email.
 
 resource "aws_sns_topic" "upload_notifications" {
   name         = "BuilderCardsUploadNotifications"
