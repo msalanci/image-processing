@@ -31,6 +31,9 @@ Environment variables, set by Terraform:
     COMMITTER_FUNCTION_NAME: The committer Lambda, invoked to publish or delete a card.
     REJECTED_PREFIX: The quarantine prefix of rejected uploads (default "images/rejected/").
     RAW_PREFIX: The upload prefix that triggers the card-detect gate (default "images/raw/").
+    FORCE_PROCESS_META: The S3 metadata key that "Put to process" sets, so the card-detect gate
+        forwards the upload without scoring it again (default "force-process"). It must equal the
+        gate's own setting, so Terraform sets both from one value.
     AWS_REGION: Set by the Lambda runtime.
 
 It writes edited fields and publish state to existing DynamoDB items (never new ones), and moves or
@@ -46,8 +49,6 @@ import json
 import base64
 import hashlib
 import urllib.parse
-import urllib.request
-import urllib.error
 
 import boto3
 
@@ -63,9 +64,7 @@ COMMITTER_FUNCTION_NAME = os.environ.get("COMMITTER_FUNCTION_NAME", "")
 
 REJECTED_PREFIX = os.environ.get("REJECTED_PREFIX", "images/rejected/")
 RAW_PREFIX = os.environ.get("RAW_PREFIX", "images/raw/")
-# Must stay equal to FORCE_PROCESS_META in the card-detect gate, which forwards an object carrying
-# this metadata key without scoring it again.
-FORCE_PROCESS_META = "force-process"
+FORCE_PROCESS_META = os.environ.get("FORCE_PROCESS_META", "force-process")
 REJECTED_URL_TTL = 3600
 
 ddb = boto3.client("dynamodb", region_name=REGION)
@@ -483,13 +482,17 @@ def _reprocess_rejected(key):
     re-submit must rewrite the metadata to add the marker, and copy_object only does that when
     MetadataDirective="REPLACE" is remembered, while a read and a PUT have no such flag to forget.
     The key is checked against the quarantine prefix, so this cannot be pointed at arbitrary
-    objects.
+    objects. Once the PUT has succeeded the upload is already being processed, so a failure to
+    remove the quarantined copy is only a warning: reporting it as a failure would invite a second
+    "Put to process" and a duplicate card.
 
     Args:
         key: S3 key of the rejected object, which must be under the quarantine prefix.
 
     Returns:
-        Tuple of (raw_key, None) on success, or (None, error_string) on failure.
+        Tuple of (raw_key, None) on success; (raw_key, warning_string) when the upload was sent to
+        processing but its quarantined copy could not be removed; or (None, error_string) when
+        nothing was sent.
     """
     if not key or not key.startswith(REJECTED_PREFIX):
         return None, f"key must be under {REJECTED_PREFIX}"
@@ -508,10 +511,13 @@ def _reprocess_rejected(key):
             Metadata=md,
             ContentType=obj.get("ContentType", "image/jpeg"),
         )
-        s3.delete_object(Bucket=IMAGES_BUCKET, Key=key)
-        return raw_key, None
     except Exception as e:  # noqa: BLE001
         return None, str(e)
+    try:
+        s3.delete_object(Bucket=IMAGES_BUCKET, Key=key)
+    except Exception as e:  # noqa: BLE001
+        return raw_key, f"the rejected copy could not be removed: {e}"
+    return raw_key, None
 
 
 def _delete_rejected(key):
@@ -552,7 +558,7 @@ PAGE_CSS = """
            vertical-align: top; }
   .status-pending { color: #c60; font-weight: 700; }
   .status-approved { color: #070; font-weight: 700; }
-  /* publishStatus colours (PROBLEMS.md #3): green = on GitHub, red = failed
+  /* publishStatus colours: green = on GitHub, red = failed
      (re-save to retry), orange = in flight. */
   .publish-published { color: #070; font-weight: 700; }
   .publish-failed { color: #c00; font-weight: 700; }
@@ -618,14 +624,15 @@ def render_list(status_filter, saved_id=None, note=None, deleted_id=None):
     content security policy allows no script.
     The optional arguments drive the confirmation banner shown after a redirect, so the result of a
     save or a delete is visible on the page the user lands on rather than being lost in the
-    redirect. A failed delete is reported with the card still listed, so it can be retried.
+    redirect. A delete that did not finish is reported without claiming what was or was not
+    removed, because the committer may have stopped after GitHub and S3; running it again is safe.
 
     Args:
         status_filter: Status to filter by, or None for all cards.
         saved_id: Card just saved, confirmed in the banner; it takes precedence over deleted_id.
         note: Tokens separated by ";;" that fill the banner: "pub:<commit url>" and
-            "gh_err:<message>" after a save, "del_err:<message>" after a failed delete. Other tokens
-            are ignored.
+            "gh_err:<message>" after a save, "del_err:<message>" after a delete that did not finish,
+            and one "del_warn:<message>" per warning of a delete that did. Other tokens are ignored.
         deleted_id: Card just deleted, or whose delete failed, reported in the banner.
 
     Returns:
@@ -674,13 +681,21 @@ def render_list(status_filter, saved_id=None, note=None, deleted_id=None):
         banner = f"<div class='saved'>Saved {esc(saved_id)}.{extra}</div>"
     elif deleted_id:
         err = ""
+        warnings = []
         for t in (note.split(";;") if note else []):
             if t.startswith("del_err:"):
                 err = t[len("del_err:"):]
+            elif t.startswith("del_warn:"):
+                warnings.append(t[len("del_warn:"):])
         if err:
             banner = (
-                f"<div class='deleted'><b>Delete failed for {esc(deleted_id)}:</b> "
-                f"{esc(err)} &middot; nothing was removed — try again.</div>"
+                f"<div class='deleted'><b>The delete did not finish for {esc(deleted_id)}:</b> "
+                f"{esc(err)} &middot; try again.</div>"
+            )
+        elif warnings:
+            banner = (
+                f"<div class='deleted'>Deleted {esc(deleted_id)} — DynamoDB item removed, with "
+                f"warnings: {' &middot; '.join(esc(w) for w in warnings)}</div>"
             )
         else:
             banner = (
@@ -811,9 +826,11 @@ def render_delete_confirm(card_id):
     Renders the confirmation page of the card kill switch, reached by the GET Delete buttons.
 
     The page names the DynamoDB item and the S3 images the committer will remove, names the card's
-    GitHub files too when its publishStatus is "published", and holds the CSRF-protected POST form
-    that performs the delete. It is a page rather than a JavaScript confirm because the admin
-    content security policy allows no script.
+    GitHub files too whenever it has a slug, and holds the CSRF-protected POST form that performs
+    the delete. The GitHub line does not depend on publishStatus, because the committer deletes the
+    files of any card with a slug, and a card whose republish failed may still be live from an
+    earlier publish. It is a page rather than a JavaScript confirm because the admin content
+    security policy allows no script.
 
     Args:
         card_id: Identifier of the card queued for deletion.
@@ -834,8 +851,8 @@ def render_delete_confirm(card_id):
 
     gh_line = (
         f"<li>GitHub: <code>{esc(slug)}.md</code> + <code>{esc(card_id)}.png</code> "
-        f"on the live branch (the card is <b>published</b> — this takes it OFF the site)</li>"
-        if slug and ps == "published"
+        f"on the live branch, if a publish put them there (this takes the card OFF the site)</li>"
+        if slug
         else "<li>GitHub: nothing (card was never published)</li>"
     )
     img_url = _finished_image_url(item)
@@ -917,7 +934,8 @@ def render_rejected(note=None, reprocessed=None, deleted=None):
 
     Args:
         note: Tokens separated by ";;": "reproc_err:<message>" or "reject_del_err:<message>" after a
-            failed action. Other tokens are ignored.
+            failed action, "reproc_warn:<message>" after a put to process that left the rejected
+            copy behind. Other tokens are ignored.
         reprocessed: Key of the upload just sent back for processing, if any.
         deleted: Key of the upload just deleted, if any.
 
@@ -942,6 +960,11 @@ def render_rejected(note=None, reprocessed=None, deleted=None):
                 banner = f"<div class='deleted'><b>Put to process failed:</b> {esc(t[len('reproc_err:'):])}</div>"
             elif t.startswith("reject_del_err:"):
                 banner = f"<div class='deleted'><b>Delete failed:</b> {esc(t[len('reject_del_err:'):])}</div>"
+            elif t.startswith("reproc_warn:"):
+                banner += (
+                    f"<div class='warn'><b>Warning:</b> {esc(t[len('reproc_warn:'):])}. It is already "
+                    f"being processed: delete it here rather than putting it to process again.</div>"
+                )
 
     if err:
         cards_html = f"<div class='warn'>Could not list rejected uploads: {esc(err)}</div>"
@@ -1334,7 +1357,8 @@ def handle_save(event):
     Handles the edit form POST: validates, saves, and publishes when approved.
 
     This is the human approval gate, and the only route that can put a card on the public site.
-    Nothing is written without a valid CSRF token and values that pass _validate(). Every save
+    Nothing is written without a valid CSRF token and values that pass _validate(). Every field is
+    stripped of surrounding whitespace first, so the value saved is the value checked. Every save
     while the status is approved republishes, so editing a published card (fixing a typo, say)
     overwrites its files on the live branch: the markdown is keyed by the slug and the image by the
     stable cardId, so the same card lands on the same paths. A changed slug leaves the old
@@ -1366,7 +1390,7 @@ def handle_save(event):
             403,
         )
 
-    values = {f: form.get(f, [""])[0] for f in EDITABLE}
+    values = {f: form.get(f, [""])[0].strip() for f in EDITABLE}
 
     problem = _validate(values)
     if problem:
@@ -1419,8 +1443,10 @@ def handle_delete(event):
         event: API Gateway event carrying the form body with cardId and CSRF token.
 
     Returns:
-        A redirect back to the list, with a del_err note when the committer reported an error; or an
-        HTML error response on a missing cardId (400) or a rejected CSRF token (403).
+        A redirect back to the list, with a del_err note when the committer reported an error, or a
+        del_warn note for each warning of a finished delete (a skipped GitHub step, S3 objects not
+        removed); or an HTML error response on a missing cardId (400) or a rejected CSRF token
+        (403).
     """
     form = urllib.parse.parse_qs(_read_body(event), keep_blank_values=True)
     card_id = form.get("cardId", [""])[0]
@@ -1434,10 +1460,17 @@ def handle_delete(event):
             403,
         )
 
-    _summary, err = _invoke_deleter(card_id)
+    summary, err = _invoke_deleter(card_id)
     loc = f"{BASE}?deleted={urllib.parse.quote(card_id)}"
     if err:
         loc += f"&note={urllib.parse.quote('del_err:' + err)}"
+    else:
+        warnings = list(summary.get("s3_warnings", []))
+        if summary.get("github_skipped"):
+            warnings.insert(0, f"GitHub step skipped ({summary['github_skipped']}): check the live "
+                               f"branch for a page left behind")
+        if warnings:
+            loc += f"&note={urllib.parse.quote(';;'.join('del_warn:' + w for w in warnings))}"
     return _redirect(loc)
 
 
@@ -1465,12 +1498,14 @@ def handle_reprocess(event):
             f"<p>Invalid or missing CSRF token. Reload the rejected page and try again.</p>"
             f"<a href='{BASE}?status=rejected'>back</a>", 403,
         )
-    _raw_key, err = _reprocess_rejected(key)
+    raw_key, err = _reprocess_rejected(key)
     loc = f"{BASE}?status=rejected"
-    if err:
+    if not raw_key:
         loc += f"&note={urllib.parse.quote('reproc_err:' + err)}"
     else:
         loc += f"&reprocessed={urllib.parse.quote(key)}"
+        if err:
+            loc += f"&note={urllib.parse.quote('reproc_warn:' + err)}"
     return _redirect(loc)
 
 
