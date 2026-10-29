@@ -86,12 +86,15 @@ def handler(event, context):
     """
     Lambda entry point: validates an upload request and returns a pre-signed POST for S3.
 
-    A request is accepted only when contentType, trimmed and lower-cased, is in ALLOWED_CONTENT_TYPES
-    (image/jpeg when missing, null or empty), year is four digits between MIN_YEAR and the current UTC
-    year, and the trimmed eventName and uploader are at most MAX_EVENT_NAME_LEN and MAX_UPLOADER_LEN
-    characters. The upper year bound is read from the clock on every request, so it advances on
-    1 January without a redeploy and no card can be dated in the future. A body that is not valid JSON
-    counts as an empty object, so it is rejected for its missing year instead of raising.
+    A request is accepted only when contentType, eventName and uploader are each a string, null or
+    missing; contentType, trimmed and lower-cased, is in ALLOWED_CONTENT_TYPES (image/jpeg when missing,
+    null or empty); year is four ASCII digits between MIN_YEAR and the current UTC year; and the trimmed
+    eventName and uploader are at most MAX_EVENT_NAME_LEN and MAX_UPLOADER_LEN characters. The upper
+    year bound is read from the clock on every request, so it advances on 1 January without a redeploy
+    and no card can be dated in the future. A body that json.loads cannot read counts as an empty
+    object, so it is rejected for its missing year instead of raising. Besides invalid JSON, that
+    covers a number longer than Python's 4300-digit limit, which raises ValueError rather than
+    JSONDecodeError, and nesting too deep for the stack, which raises RecursionError.
 
     The object key is RAW_PREFIX followed by "<event>_<year>_<uuid>.jpg". The event part keeps only ASCII
     letters, digits and hyphens, at most 60 characters, and is "card" when nothing is left, so it never
@@ -119,17 +122,20 @@ def handler(event, context):
     body = event.get("body") or "{}"
     try:
         data = json.loads(body)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         data = {}
     if not isinstance(data, dict):
         return _resp(400, {"error": "body must be a JSON object"})
+    for field in ("contentType", "eventName", "uploader"):
+        if data.get(field) is not None and not isinstance(data[field], str):
+            return _resp(400, {"error": f"{field} must be a string"})
 
     content_type = (data.get("contentType") or "image/jpeg").strip().lower()
     if content_type not in ALLOWED_CONTENT_TYPES:
         return _resp(400, {"error": "contentType must be an image type (jpeg/png/webp/heic/bmp/tiff)"})
 
     year = str(data.get("year") or "").strip()
-    if not re.fullmatch(r"\d{4}", year):
+    if not re.fullmatch(r"[0-9]{4}", year):
         return _resp(400, {"error": "year must be 4 digits, e.g. 2024"})
     current_year = datetime.now(timezone.utc).year
     if not (MIN_YEAR <= int(year) <= current_year):
