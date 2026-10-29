@@ -100,6 +100,8 @@ resource "aws_ecr_lifecycle_policy" "card_detect" {
 
 # Same build flags as image_processor_build, for the same reasons. onnx_out/ is git-ignored: generate
 # it in place with lambda/card-detect/build_onnx.py before the first apply, or filesha1 fails.
+# It runs after image_processor_build: both builds docker login to the same registry, and two logins
+# at the same moment can fail on macOS with "The specified item already exists in the keychain".
 resource "null_resource" "card_detect_build" {
   triggers = {
     dockerfile    = filesha1("${path.module}/lambda/card-detect/Dockerfile")
@@ -127,4 +129,6 @@ resource "null_resource" "card_detect_build" {
       docker push ${aws_ecr_repository.card_detect.repository_url}:latest
     EOT
   }
+
+  depends_on = [null_resource.image_processor_build]
 }
