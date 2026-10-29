@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Michal Salanci
 #
-# SNS topics that email the maintainer, each with one email subscription: new uploads
-# to review (SNS1, published by the image-processor), Amplify deploy results (SNS3, by
-# the EventBridge rule) and auto-rejected uploads (SNS4, by the card-detect gate).
+# SNS topics that email the maintainer, each with one email subscription: new uploads to review
+# (SNS1, published by the image-processor), Amplify deploy results (SNS3, by the EventBridge rule),
+# auto-rejected uploads (SNS4, by the card-detect gate) and alarms (by the failed-events alarm).
 # Email subscriptions cannot be confirmed automatically: each new one stays pending until
 # the maintainer clicks the link in AWS's confirmation email.
 
@@ -36,6 +36,17 @@ resource "aws_sns_topic" "reject_notifications" {
 
 resource "aws_sns_topic_subscription" "reject_email" {
   topic_arn = aws_sns_topic.reject_notifications.arn
+  protocol  = "email"
+  endpoint  = var.notification_email
+}
+
+resource "aws_sns_topic" "alarms" {
+  name         = "BuilderCardsAlarms"
+  display_name = "Builder Cards Alarms"
+}
+
+resource "aws_sns_topic_subscription" "alarms_email" {
+  topic_arn = aws_sns_topic.alarms.arn
   protocol  = "email"
   endpoint  = var.notification_email
 }

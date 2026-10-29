@@ -113,15 +113,13 @@ scores) · [image-processor](infrastructure/lambda/image-processor/README.md)
 │   │   │   ├── README.md
 │   │   │   ├── requirements.txt
 │   │   │   └── test-event.json
-│   │   ├── <a href="infrastructure/lambda/review-editor/"><b>review-editor/</b></a>                    <i>human in the loop, renders the review page</i>
-│   │   │   └── index.py
-│   │   └── <a href="infrastructure/lambda/list-of-lambdas.md">list-of-lambdas.md</a>                <i>what each Lambda does, its trigger, environment and permissions</i>
+│   │   └── <a href="infrastructure/lambda/review-editor/"><b>review-editor/</b></a>                    <i>human in the loop, renders the review page</i>
+│   │       └── index.py
 │   ├── apigw.tf
-│   ├── create-secrets.txt                    <i>how to set the two secrets after the first apply</i>
 │   ├── dynamodb.tf
 │   ├── ecr.tf
 │   ├── eventbridge.tf
-│   ├── failed_events.tf                      <i>the queue that keeps events the Lambdas could not process</i>
+│   ├── failed_events.tf                      <i>the queue that keeps events the Lambdas could not process, and its alarm</i>
 │   ├── iam.tf
 │   ├── lambda.tf
 │   ├── logs.tf                               <i>the Lambdas' log groups and their retention</i>
@@ -130,7 +128,6 @@ scores) · [image-processor](infrastructure/lambda/image-processor/README.md)
 │   ├── secrets.tf
 │   ├── sns.tf
 │   ├── terraform.tfvars.example              <i>copy it to terraform.tfvars and fill in your values</i>
-│   ├── testing.txt                           <i>a quick upload test with curl</i>
 │   ├── variables.tf
 │   └── versions.tf
 ├── images/                                   <i>the architecture diagram</i>
@@ -222,6 +219,10 @@ terraform apply   # macOS + Docker Desktop: read Deploy gotchas below first
 Apply builds + pushes both container images and creates everything, including
 two **empty** Secrets Manager containers. Terraform never sees the values.
 
+AWS then sends your `notification_email` one confirmation email per SNS topic: new uploads,
+deploy results, rejected uploads and alarms. **Click the link in each one** - until you do,
+that topic's emails never arrive, including the alarm described in "When an upload keeps failing".
+
 ### 4. Populate the two secrets - after apply, out-of-band
 
 `put-secret-value` needs the container to exist, which is why this follows
@@ -262,6 +263,43 @@ branch, Amplify rebuilds the site, and the deploy-status email arrives.
 - **Attribution:** the form takes an optional uploader name (60 chars), stored
   as S3 object metadata and carried into the card's DynamoDB record. It is
   self-declared and unverified - treat it as a label, not an identity.
+
+---
+
+## When an upload keeps failing
+
+card-detect and the image-processor are invoked asynchronously. When one of them fails on an
+upload (S3 or Bedrock briefly down, for example), Lambda retries it twice; if the third attempt fails
+too, the event goes to the SQS queue **`BuilderCardsFailedEvents`**, which keeps it for 14 days.
+
+The alarm **`BuilderCardsFailedEventsWaiting`** checks that queue every 5 minutes and emails you
+through the **`BuilderCardsAlarms`** topic as soon as an event is waiting ("ALARM"), and once more when
+the queue is empty again ("OK"). It does not repeat while events wait, so one email can stand for several.
+
+When the ALARM email arrives, from `infrastructure/`:
+
+```bash
+QUEUE=$(terraform output -raw failed_events_queue_url)
+
+# 1. Read the waiting events. Each body holds the failed function (requestContext.functionArn), the
+#    error (responsePayload) and the original event (requestPayload). Each message stays hidden from
+#    other readers for 15 minutes, long enough for steps 2 and 3.
+aws sqs receive-message --queue-url "$QUEUE" --max-number-of-messages 10 \
+  --visibility-timeout 900 --query 'Messages[].[ReceiptHandle,Body]' --output text
+
+# 2. Re-run one event once its cause is fixed: send its original event to the function that failed.
+BODY='<the Body of one message>'
+FUNCTION=$(echo "$BODY" | jq -r '.requestContext.functionArn | sub(":\\$LATEST$"; "")')
+echo "$BODY" | jq -c .requestPayload > event.json
+aws lambda invoke --function-name "$FUNCTION" --invocation-type Event \
+  --cli-binary-format raw-in-base64-out --payload file://event.json /dev/null
+
+# 3. Delete the message, so the alarm can clear.
+aws sqs delete-message --queue-url "$QUEUE" --receipt-handle '<its ReceiptHandle>'
+```
+
+A re-run is safe: card-detect scores the upload again, and the image-processor rewrites the same card,
+because its cardId comes from the upload's file name.
 
 ---
 

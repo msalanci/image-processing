@@ -59,3 +59,8 @@ output "failed_events_queue_url" {
   description = "URL of the SQS queue that keeps, for 14 days, the upload events card-detect or the image-processor still failed on after Lambda's retries"
   value       = aws_sqs_queue.failed_events.url
 }
+
+output "alarms_topic_arn" {
+  description = "ARN of the SNS topic that emails the maintainer when an alarm, such as the failed-events alarm, changes state"
+  value       = aws_sns_topic.alarms.arn
+}
