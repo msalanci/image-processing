@@ -26,6 +26,9 @@ Environment (set by Terraform unless noted; the defaults in the code only matter
     IMAGE_PROCESSOR_FUNCTION_NAME   the processor lambda the function forwards to
     REJECT_TOPIC_ARN                SNS topic for reject notifications
     REJECTED_TAB_URL                the review editor's Rejected tab, linked from the reject email
+    FORCE_PROCESS_META              (force-process) the S3 user-metadata key that the review editor
+                                    sets to have an upload forwarded without scoring; lower case and
+                                    without the x-amz-meta- prefix, as boto3 returns metadata keys
     KEEP_THRESHOLD / DROP_THRESHOLD the two score cutoffs (floats, defaults 0.50 and 0.20)
     MODEL_DIR                       (/opt/model) where visual.onnx, visual.onnx.data and
                                     text.npz live; set by the Dockerfile, not by Terraform
@@ -57,10 +60,7 @@ REJECTED_PREFIX = os.environ.get("REJECTED_PREFIX", "images/rejected/")
 IMAGE_PROCESSOR_FUNCTION_NAME = os.environ.get("IMAGE_PROCESSOR_FUNCTION_NAME", "")
 REJECT_TOPIC_ARN = os.environ.get("REJECT_TOPIC_ARN", "")
 REJECTED_TAB_URL = os.environ.get("REJECTED_TAB_URL", "")
-
-# S3 lowercases user metadata keys and boto3 drops their x-amz-meta- prefix;
-# the review editor writes this same key.
-FORCE_PROCESS_META = "force-process"
+FORCE_PROCESS_META = os.environ.get("FORCE_PROCESS_META", "force-process")
 
 KEEP_THRESHOLD = float(os.environ.get("KEEP_THRESHOLD", "0.50"))
 DROP_THRESHOLD = float(os.environ.get("DROP_THRESHOLD", "0.20"))
@@ -81,7 +81,7 @@ lambda_client = boto3.client("lambda")
 
 _SESSION = ort.InferenceSession(VISUAL_ONNX, providers=["CPUExecutionProvider"])
 _INPUT_NAME = _SESSION.get_inputs()[0].name
-_TEXT = np.load(TEXT_NPZ, allow_pickle=True)
+_TEXT = np.load(TEXT_NPZ, allow_pickle=False)
 _TEXT_EMBEDS = _TEXT["embeds"].astype(np.float32)
 _LOGIT_SCALE = float(_TEXT["logit_scale"])
 _CARD_COUNT = int(_TEXT["card_count"])
@@ -179,8 +179,8 @@ def _forward_to_processor(record):
             was not invoked by S3 directly.
 
     Returns:
-        None. Sends the asynchronous invoke, or logs an error when IMAGE_PROCESSOR_FUNCTION_NAME
-        is empty.
+        True when the asynchronous invoke was sent; False when IMAGE_PROCESSOR_FUNCTION_NAME is
+        empty, which is logged as an error instead.
 
     Raises:
         botocore.exceptions.ClientError: When Lambda refuses the invoke.
@@ -188,13 +188,14 @@ def _forward_to_processor(record):
 
     if not IMAGE_PROCESSOR_FUNCTION_NAME:
         logger.error("[CardDetect] IMAGE_PROCESSOR_FUNCTION_NAME not set — cannot forward")
-        return
+        return False
 
     lambda_client.invoke(
         FunctionName=IMAGE_PROCESSOR_FUNCTION_NAME,
         InvocationType="Event",
         Payload=json.dumps({"Records": [record]}).encode("utf-8"),
     )
+    return True
 
 
 def _quarantine(bucket, key):
@@ -317,9 +318,10 @@ def handler(event, context):
     Returns:
         HTTP-shaped dict with status 200, whose JSON body holds one result per record that was not
         skipped: the key, the verdict ("forced", "aws-card", "aws-unsure", "non-aws-card" or
-        "not-a-card") and the action ("forwarded" or "rejected"). Scored records also carry p_aws
-        and, under the key "p_card", p_any_card. Every forwarded or rejected record is also logged as
-        one JSON line. An empty results list means no record was handled.
+        "not-a-card") and the action ("forwarded", "not-forwarded" when IMAGE_PROCESSOR_FUNCTION_NAME
+        is not set, or "rejected"). Scored records also carry p_aws and, under the key "p_card",
+        p_any_card. Every such record is also logged as one JSON line. An empty results list means no
+        record was handled.
 
     Raises:
         RuntimeError: One or more records failed; the message lists their keys.
@@ -352,9 +354,9 @@ def handler(event, context):
             obj = s3.get_object(Bucket=bucket, Key=key)
 
             if obj.get("Metadata", {}).get(FORCE_PROCESS_META):
-                _forward_to_processor(record)
-                logger.info(json.dumps({"key": key, "verdict": "forced", "action": "forwarded"}))
-                results.append({"key": key, "verdict": "forced", "action": "forwarded"})
+                action = "forwarded" if _forward_to_processor(record) else "not-forwarded"
+                logger.info(json.dumps({"key": key, "verdict": "forced", "action": action}))
+                results.append({"key": key, "verdict": "forced", "action": action})
                 continue
 
             raw = obj["Body"].read()
@@ -362,8 +364,7 @@ def handler(event, context):
 
             if p_aws >= DROP_THRESHOLD:
                 verdict = "aws-card" if p_aws >= KEEP_THRESHOLD else "aws-unsure"
-                _forward_to_processor(record)
-                action = "forwarded"
+                action = "forwarded" if _forward_to_processor(record) else "not-forwarded"
             else:
                 verdict = "non-aws-card" if p_any >= DROP_THRESHOLD else "not-a-card"
                 rejected_key = _quarantine(bucket, key)

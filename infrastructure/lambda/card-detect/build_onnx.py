@@ -98,7 +98,7 @@ def main():
     Returns:
         None. Writes onnx_out/visual.onnx (with onnx_out/visual.onnx.data) and onnx_out/text.npz
         next to this file, creating onnx_out/ when it is missing, and prints its progress: each
-        path it wrote, the label counts and the logit scale.
+        path it wrote, the label counts and the logit scale, then the next step.
     """
 
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -138,7 +138,7 @@ def main():
     print(f"  wrote {text_path}  (labels={len(ALL_LABELS)}, aws={len(AWS_LABELS)}, "
           f"card={len(AWS_LABELS) + len(COMPETITOR_LABELS)}, logit_scale={logit_scale:.2f})")
 
-    print("\nDone. Now run:  python detect_card.py   (torch-free ONNX runtime)")
+    print("\nDone. Run terraform apply to rebuild the card-detect image with the new files.")
 
 
 if __name__ == "__main__":

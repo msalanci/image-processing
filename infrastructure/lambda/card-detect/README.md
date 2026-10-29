@@ -18,9 +18,8 @@ Bedrock, no BiRefNet, no GitHub — those all live downstream.
   no `open_clip`, no tokenizer, no text encoder run per request.
 
 This README covers exactly three things: **(1)** how the score is computed and how
-the gate decides, **(2)** what each file does, and **(3)** the hard line between
-the production files in this directory and the dev-only files in
-`local-tests/card-detect/`.
+the gate decides, **(2)** what each file does, and **(3)** which files ship or
+build the gate.
 
 ---
 
@@ -113,24 +112,25 @@ and the highest non-AWS upload (~0.016).
 
 If the review editor's "put to process" re-submits a false negative, it copies
 the object back into `images/raw/` with the S3 metadata marker
-`x-amz-meta-force-process` (read as `force-process`; `index.py` →
-`FORCE_PROCESS_META`). The gate checks this **before it even reads the image
-body** and forwards without scoring — so a genuine card the model got wrong is
-not scored identically and re-rejected forever.
+`x-amz-meta-force-process` (read as `force-process`; Terraform passes this name
+to the gate and the review editor as `FORCE_PROCESS_META`). The gate checks this
+**before it even reads the image body** and forwards without scoring — so a
+genuine card the model got wrong is not scored identically and re-rejected
+forever.
 
 ### Recovery is non-destructive
 
 A rejection **quarantines**, it does not delete: the raw object is copied to
 `images/rejected/` (a dead-end prefix nothing triggers on) and the original is
 deleted — but the bucket is **versioned**, so even that is recoverable. The SNS4
-email includes a ready-to-paste `aws s3 mv …` command, and the review editor's
-"put to process" is the one-click path back.
+email links the review editor's Rejected tab, whose "Put to process" button is
+the one-click path back.
 
 ---
 
 ## 2. What each file does
 
-See section 3 for the production-vs-dev split; this is the per-file reference.
+See section 3 for the short list; this is the per-file reference.
 
 **In this directory (`infrastructure/lambda/card-detect/`):**
 
@@ -139,10 +139,10 @@ See section 3 for the production-vs-dev split; this is the per-file reference.
 | `index.py`                    | The Lambda handler. Does all the scoring and the decision above. **Runs in production.**                        |
 | `Dockerfile`                  | Builds the arm64 image: installs runtime deps and bakes `onnx_out/` → `/opt/model` (`MODEL_DIR`).               |
 | `requirements.txt`            | **Runtime** pip deps: `onnxruntime`, `numpy`, `pillow`, `pillow-heif`. (`boto3` is already in the base image.)  |
-| `.dockerignore`              | Trims the build context — excludes `build_onnx.py`, `build_onnx-requirements.txt`, `.venv`, `__pycache__`, `README.md`. Note: `onnx_out/` is intentionally **not** ignored (the image bakes it in). |
+| `.dockerignore`              | Allowlist for the build context: only `requirements.txt`, `index.py` and the three `onnx_out/` files reach Docker, so `build_onnx.py`, `build_onnx-requirements.txt`, `.venv`, `__pycache__` and `README.md` stay out. |
 | `build_onnx.py`               | **Build-time** model generator. Exports the ViT-B/32 image encoder → `onnx_out/visual.onnx` and precomputes the label vectors → `onnx_out/text.npz`. Not shipped in the image, but **production-critical** — it produces the model the image bakes in. Run once before the first apply, and again whenever you change the labels or the model. |
 | `build_onnx-requirements.txt` | **Build-time** deps for `build_onnx.py` only: `torch`, `open_clip_torch`, `numpy`, `onnx`. Heavy; used once in a local venv; **never** in the runtime image. |
-| `onnx_out/`                   | **Generated** artifacts: `visual.onnx` (graph, ~87 KB), `visual.onnx.data` (~335 MB fp32 weights), `text.npz` (label vectors, ~60 KB). **Git-ignored** (too big for GitHub) and regenerable via `build_onnx.py`. `ecr.tf` hashes `visual.onnx.data` + `text.npz` to decide when to rebuild; the Dockerfile COPYs the whole dir → `/opt/model`. |
+| `onnx_out/`                   | **Generated** artifacts: `visual.onnx` (graph, ~87 KB), `visual.onnx.data` (~335 MB fp32 weights), `text.npz` (label vectors, ~60 KB). **Git-ignored** (too big for GitHub) and regenerable via `build_onnx.py`. `ecr.tf` hashes all three to decide when to rebuild; the Dockerfile COPYs the three files → `/opt/model`. |
 
 **In `infrastructure/` (referenced, not in this dir):**
 
@@ -153,20 +153,12 @@ See section 3 for the production-vs-dev split; this is the per-file reference.
 
 ---
 
-## 3. Production vs local-test — the hard line
+## 3. Production and build-critical files
 
 > **Rule of thumb:** everything in **this** Lambda directory ships or builds the
-> gate; everything in **`local-tests/card-detect/`** is dev-only and is **never
-> deployed**.
+> gate, and nothing outside it is needed to build or run it.
 
-**The key thing that changed:** `build_onnx.py` **and** `onnx_out/` now live **in
-this Lambda directory** (`infrastructure/lambda/card-detect/`). They used to live
-in `local-tests/card-detect/` and were staged/copied in at build time — that is
-**no longer true**. `build_onnx.py` and `onnx_out/` are gone from `local-tests/`.
-
-### PRODUCTION / build-critical — `infrastructure/lambda/card-detect/`
-
-The deployed Lambda plus everything that builds its image.
+The deployed Lambda plus everything that builds its image:
 
 - `index.py` — the handler that runs in production (scoring + decision).
 - `Dockerfile` — builds the arm64 image; bakes `onnx_out/` → `/opt/model`.
@@ -177,21 +169,6 @@ The deployed Lambda plus everything that builds its image.
 - `build_onnx-requirements.txt` — build-time deps for `build_onnx.py` only.
 - `onnx_out/` — generated model artifacts baked into the image (git-ignored,
   regenerable).
-
-### LOCAL-TEST ONLY — `local-tests/card-detect/`
-
-Developer tooling. **Not needed for the Lambda to build or run.** Safe to omit
-from a public or deploy cut of the repo.
-
-| File / dir                          | What it is                                                                                                       |
-| ----------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `detect_card.py`                    | Local tester: runs the ONNX artifacts (torch-free) over `input/` and also carries a PyTorch reference. Its `preprocess_np()` is the code later ported **verbatim** into `index.py`. |
-| `parity_proof.py`                   | Harness proving the ONNX path matches the PyTorch reference (max \|diff\| ≤ 0.01, verdict parity, no real card dropped). |
-| `input/`                            | Local test images — real AWS cards, competitor cards, non-cards.                                                |
-| `results.csv` / `results.txt`       | Saved outputs from the **PyTorch reference** run.                                                               |
-| `results_onnx.csv` / `results_onnx.txt` | Saved outputs from the **ONNX** run (compared against the reference).                                       |
-| `explanation.md`                    | A short local note.                                                                                            |
-| `.venv/`                            | Local virtualenv for running those scripts.                                                                    |
 
 ---
 
@@ -207,12 +184,12 @@ from a public or deploy cut of the repo.
    ```
 
 2. **`terraform apply`** → `ecr.tf`'s `null_resource.card_detect_build` fires when
-   any of its trigger hashes change: `Dockerfile`, `index.py`, `requirements.txt`,
-   `onnx_out/visual.onnx.data`, `onnx_out/text.npz`. On a change it runs
+   any of its trigger hashes change: `Dockerfile`, `.dockerignore`, `index.py`,
+   `requirements.txt`, `onnx_out/visual.onnx`, `onnx_out/visual.onnx.data`,
+   `onnx_out/text.npz`. On a change it runs
    `docker buildx build --platform linux/arm64 --provenance=false --load` and
    `docker push`. Because `onnx_out/` already lives in the build context, **nothing
-   is staged or copied** — unlike the old flow that pulled from
-   `../local-tests/card-detect/`.
+   is staged or copied**.
 
 3. The **Dockerfile** bakes `onnx_out/` → `/opt/model` (`MODEL_DIR`) and installs
    the runtime deps.
@@ -238,6 +215,8 @@ AWS label describes another way a real AWS card can look.
 | `REJECTED_PREFIX`               | `images/rejected/`  | Quarantine prefix (dead-end).                        |
 | `IMAGE_PROCESSOR_FUNCTION_NAME` | (set by TF)         | The processor Lambda the gate forwards to.           |
 | `REJECT_TOPIC_ARN`              | (set by TF)         | SNS4 reject-email topic.                             |
+| `REJECTED_TAB_URL`              | (set by TF)         | Review editor's Rejected tab, linked from the email. |
+| `FORCE_PROCESS_META`            | `force-process`     | Metadata key that forwards an upload unscored; the review editor sets the same key. |
 | `KEEP_THRESHOLD`                | `0.50`              | `p_aws >=` → `aws-card` (confident forward).         |
 | `DROP_THRESHOLD`                | `0.20`              | `p_aws <` → reject (quarantine).                     |
 | `MODEL_DIR`                     | `/opt/model`        | Where the baked `visual.onnx` + `text.npz` live.     |
