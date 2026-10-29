@@ -5,10 +5,10 @@
 #
 #   cp terraform.tfvars.example terraform.tfvars    # then put in your own values
 #
-# terraform.tfvars is git-ignored (.gitignore): it holds your email, your GitHub site repository and your
-# Amplify app ID. Every variable is described in variables.tf; the ones with a default there can be left
-# out. Secrets (the GitHub token, the review editor's Basic Auth) live in AWS Secrets Manager and are set
-# out-of-band, never here.
+# terraform.tfvars is git-ignored (.gitignore): it holds your email, your GitHub site repository, your
+# site's web origins and your Amplify app ID. Every variable is described in variables.tf; the ones with
+# a default there can be left out. Secrets (the GitHub token, the review editor's Basic Auth) live in AWS
+# Secrets Manager and are set out-of-band, never here.
 
 aws_region = "eu-central-1"
 
@@ -16,9 +16,8 @@ images_bucket_name = "my-buildercards-images"
 
 notification_email = "you@example.com"
 
-github_owner       = "your-github-user"
-github_repo        = "your-site-repo"
-github_base_branch = "main"
+github_owner = "your-github-user"
+github_repo  = "your-site-repo"
 
 github_publish_branch = "main"
 
@@ -27,3 +26,13 @@ bedrock_region = "eu-central-1"
 
 amplify_app_id      = "d1a2b3c4d5e6f7"
 amplify_branch_name = "main"
+
+allowed_origins = [
+  "https://www.example.com",
+]
+
+static_cards_dir     = "."
+raw_download_dir     = "."
+corners_download_dir = "."
+
+import_existing_log_groups = false

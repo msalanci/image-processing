@@ -92,16 +92,6 @@ scores) · [image-processor](infrastructure/lambda/image-processor/README.md)
 
 ## Repository layout
 
-<!--
-```
-AGENTS.md                  conventions for humans + AI coding agents
-infrastructure/            all Terraform (*.tf)
-
-  lambda/card-detect/      the gate + build_onnx.py model export. [README](infrastructure/lambda/card-detect/README.md)
-  lambda/image-processor/  the cleanup pipeline. [README](infrastructure/lambda/image-processor/README.md)
-  lamnbda/
-```
--->
 <pre>
 .
 ├── <a href="infrastructure/"><b>infrastructure/</b></a>                           <i>all Terraform files and the lambdas</i>
@@ -123,22 +113,27 @@ infrastructure/            all Terraform (*.tf)
 │   │   │   ├── README.md
 │   │   │   ├── requirements.txt
 │   │   │   └── test-event.json
-│   │   └── <a href="infrastructure/lambda/review-editor/"><b>review-editor/</b></a>                    <i>human in the loop, renders the review page</i>
-│   │       └── index.py
+│   │   ├── <a href="infrastructure/lambda/review-editor/"><b>review-editor/</b></a>                    <i>human in the loop, renders the review page</i>
+│   │   │   └── index.py
+│   │   └── <a href="infrastructure/lambda/list-of-lambdas.md">list-of-lambdas.md</a>                <i>what each Lambda does, its trigger, environment and permissions</i>
 │   ├── apigw.tf
+│   ├── create-secrets.txt                    <i>how to set the two secrets after the first apply</i>
 │   ├── dynamodb.tf
 │   ├── ecr.tf
 │   ├── eventbridge.tf
+│   ├── failed_events.tf                      <i>the queue that keeps events the Lambdas could not process</i>
 │   ├── iam.tf
 │   ├── lambda.tf
+│   ├── logs.tf                               <i>the Lambdas' log groups and their retention</i>
 │   ├── outputs.tf
 │   ├── s3.tf
 │   ├── secrets.tf
 │   ├── sns.tf
-│   ├── terraform.tfvars
+│   ├── terraform.tfvars.example              <i>copy it to terraform.tfvars and fill in your values</i>
+│   ├── testing.txt                           <i>a quick upload test with curl</i>
 │   ├── variables.tf
 │   └── versions.tf
-├── AGENTS.md                                 <i>conventions for humans + AI coding agents</i>
+├── images/                                   <i>the architecture diagram</i>
 └── LICENSE
 </pre>
 
@@ -170,12 +165,25 @@ credentials**, and **Python 3** (for Setup step 2).
 
 ### 1. Configure `infrastructure/terraform.tfvars`
 
-Edit the `<your-...>` placeholders in place: bucket name, email, GitHub
-owner/repo/branches, region, `bedrock_llm`, `amplify_app_id`. 
-The three `*_dir` values at the bottom are optional - they only shape the copy-paste commands in
-the notification email, so point them at your own machine's layout. 
-The file is tracked, so don't commit your real values back - and **never put secrets in it**
-(those are set in step 4).
+```bash
+cp infrastructure/terraform.tfvars.example infrastructure/terraform.tfvars
+```
+
+Then replace the placeholders with your own values: bucket name, email, GitHub owner/repo/branches,
+region, `bedrock_llm`, `amplify_app_id`, and:
+
+- `allowed_origins` - **required**: the addresses your site is served from, for example
+  `["https://example.com", "https://www.example.com"]`. Browsers may call the upload API and post photos
+  to the bucket only from these origins.
+- `import_existing_log_groups` - leave it `false` on a fresh deployment. Set it to `true` only if the
+  five `/aws/lambda/BuilderCards*` log groups already exist in your account, so Terraform adopts them
+  instead of failing to create them.
+- `lambda_log_retention_days` - how long the Lambdas' logs are kept (default 90 days).
+- The three `*_dir` values are optional: they only shape the copy-paste download commands in the
+  notification email, so point them at your own folders.
+
+`terraform.tfvars` is git-ignored, so your values stay out of the repository - and **never put secrets
+in it** (those are set in step 4).
 
 ### 2. Generate the card-detect model - required before the first apply
 
