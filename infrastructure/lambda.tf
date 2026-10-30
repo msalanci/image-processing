@@ -155,6 +155,8 @@ resource "aws_lambda_function" "committer" {
       GITHUB_OWNER          = var.github_owner
       GITHUB_REPO           = var.github_repo
       GITHUB_PUBLISH_BRANCH = var.github_publish_branch
+      GITHUB_CONTENT_DIR    = var.github_content_dir
+      GITHUB_IMAGE_DIR      = var.github_image_dir
       IMAGES_BUCKET         = var.images_bucket_name
       DDB_TABLE             = aws_dynamodb_table.cards.name
     }

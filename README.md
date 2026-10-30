@@ -260,16 +260,16 @@ from the site's upload form. Your Hugo site has to meet it in three places.
 When you approve a card, the committer makes **one commit** to your publish branch
 (`github_publish_branch`) with two files. The paths are from the root of your site's repository:
 
-| File             | Folder (default)                             | File name      |
-| ---------------- | -------------------------------------------- | -------------- |
-| The card's page  | `web/awsbuildercards/content/collectibles/`  | `<slug>.md`    |
-| The card's image | `web/awsbuildercards/static/cards/`          | `<cardId>.png` |
+| File             | Folder (variable, default)                     | File name      |
+| ---------------- | ---------------------------------------------- | -------------- |
+| The card's page  | `github_content_dir`, `content/collectibles`   | `<slug>.md`    |
+| The card's image | `github_image_dir`, `static/cards`             | `<cardId>.png` |
 
-- **Other folders:** both are defaults in `infrastructure/lambda/committer/index.py`, and Terraform
-  doesn't set them. If your site lives elsewhere, add `GITHUB_CONTENT_DIR` and `GITHUB_IMAGE_DIR` to the
-  committer's `environment` block in `infrastructure/lambda.tf`, then apply.
-- **The image folder must end in `static/cards`** of your Hugo site: the page points at
-  `/cards/<cardId>.png`, and Hugo serves `static/` at the site's root.
+- **Other folders:** the defaults fit a Hugo site at the root of its repository. If yours lives in a
+  subfolder, such as `site/`, set both variables in `terraform.tfvars` (`site/content/collectibles` and
+  `site/static/cards`).
+- **The image folder must end in `static/cards`**, and the variable's validation checks it: the page
+  points at `/cards/<cardId>.png`, and Hugo serves `static/` at the site's root.
 - **The branch must already exist.** The commit is built on its current files, so nothing else in the
   repository changes. The commit message is `card: <slug> (<cardId>)`.
 - **Names:** `<slug>` is lowercase letters and digits in groups joined by single hyphens, at most 100

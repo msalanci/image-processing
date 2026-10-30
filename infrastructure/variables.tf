@@ -165,6 +165,28 @@ variable "github_publish_branch" {
   default     = "master"
 }
 
+variable "github_content_dir" {
+  description = "Folder of the site repository, from its root, that the committer Lambda writes each card's markdown page (<slug>.md) to. The default, content/collectibles, fits a Hugo site at the root of its repository. Override in terraform.tfvars."
+  type        = string
+  default     = "content/collectibles"
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$", var.github_content_dir))
+    error_message = "The content folder must be a relative path such as content/collectibles, with no leading or trailing slash and no part that starts with a dot."
+  }
+}
+
+variable "github_image_dir" {
+  description = "Folder of the site repository, from its root, that the committer Lambda writes each card's image (<cardId>.png) to. It must end in static/cards, because every card page points at /cards/<cardId>.png and Hugo serves static/ at the site's root. The default, static/cards, fits a Hugo site at the root of its repository. Override in terraform.tfvars."
+  type        = string
+  default     = "static/cards"
+
+  validation {
+    condition     = can(regex("^([A-Za-z0-9_-][A-Za-z0-9._-]*/)*static/cards$", var.github_image_dir))
+    error_message = "The image folder must be a relative path that ends in static/cards, such as static/cards or site/static/cards, with no part that starts with a dot."
+  }
+}
+
 variable "amplify_branch_name" {
   description = "Amplify branch whose deploys trigger the SNS3 email (your live/deploy branch, normally equal to github_publish_branch). The EventBridge rule matches it exactly, so a mismatch such as main versus master silently drops the deploy email while the site still builds. Defaults to master. Override in terraform.tfvars."
   type        = string

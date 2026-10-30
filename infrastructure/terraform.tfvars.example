@@ -20,6 +20,8 @@ github_owner = "your-github-user"
 github_repo  = "your-site-repo"
 
 github_publish_branch = "main"
+github_content_dir    = "content/collectibles"
+github_image_dir      = "static/cards"
 
 bedrock_llm    = "eu.amazon.nova-2-lite-v1:0"
 bedrock_region = "eu-central-1"

@@ -26,8 +26,9 @@ Environment variables:
     GITHUB_PUBLISH_BRANCH: The branch both actions commit to; in the single-branch setup it is the
         live branch that Amplify builds (master). It must already exist, because the Git Data API
         does not create branches. Terraform always sets it; the default is only a fallback.
-    GITHUB_CONTENT_DIR, GITHUB_IMAGE_DIR: Optional repository folders for the markdown pages and the
-        card images. Terraform does not set them, so the built-in defaults apply.
+    GITHUB_CONTENT_DIR, GITHUB_IMAGE_DIR: The repository folders, from its root, for the markdown
+        pages and the card images. Terraform always sets them; the defaults, which fit a Hugo site at
+        the root of its repository, are only a fallback.
     IMAGES_BUCKET: The private image bucket; publish reads the finished PNG from it, delete removes
         the card's objects.
     DDB_TABLE: The card table, read by both actions.
@@ -70,8 +71,8 @@ GITHUB_PAT_SECRET_ARN = os.environ.get("GITHUB_PAT_SECRET_ARN", "")
 GITHUB_OWNER = os.environ.get("GITHUB_OWNER", "")
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
 GITHUB_PUBLISH_BRANCH = os.environ.get("GITHUB_PUBLISH_BRANCH", "master")
-GITHUB_CONTENT_DIR = os.environ.get("GITHUB_CONTENT_DIR", "web/awsbuildercards/content/collectibles")
-GITHUB_IMAGE_DIR = os.environ.get("GITHUB_IMAGE_DIR", "web/awsbuildercards/static/cards")
+GITHUB_CONTENT_DIR = os.environ.get("GITHUB_CONTENT_DIR", "content/collectibles")
+GITHUB_IMAGE_DIR = os.environ.get("GITHUB_IMAGE_DIR", "static/cards")
 IMAGES_BUCKET = os.environ.get("IMAGES_BUCKET", "")
 DDB_TABLE = os.environ.get("DDB_TABLE", "BuilderCards")
 
