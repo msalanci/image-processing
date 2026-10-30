@@ -143,6 +143,7 @@ Create these **before** the first `terraform apply` (none are managed here):
 - A **GitHub repo** holding your Hugo site, with a publish branch that **allows
   direct pushes** (`github_owner` / `github_repo`). Don't require PRs on it, 
   the committer pushes straight to it. Human review is the gate instead.
+  [Your site](#your-site-what-the-pipeline-expects) says what the site must provide.
 
 - An **AWS Amplify app** connected to that repo, created in the console and
   referenced here only by ID. Its App ID is the `amplify_app_id` variable, which
@@ -249,6 +250,144 @@ branch, Amplify rebuilds the site, and the deploy-status email arrives.
 
 ---
 
+## Your site: what the pipeline expects
+
+The pipeline never builds your site. It writes cards into the site's repository, and it takes photos
+from the site's upload form. Your Hugo site has to meet it in three places.
+
+### The folders the committer writes to
+
+When you approve a card, the committer makes **one commit** to your publish branch
+(`github_publish_branch`) with two files. The paths are from the root of your site's repository:
+
+| File             | Folder (default)                             | File name      |
+| ---------------- | -------------------------------------------- | -------------- |
+| The card's page  | `web/awsbuildercards/content/collectibles/`  | `<slug>.md`    |
+| The card's image | `web/awsbuildercards/static/cards/`          | `<cardId>.png` |
+
+- **Other folders:** both are defaults in `infrastructure/lambda/committer/index.py`, and Terraform
+  doesn't set them. If your site lives elsewhere, add `GITHUB_CONTENT_DIR` and `GITHUB_IMAGE_DIR` to the
+  committer's `environment` block in `infrastructure/lambda.tf`, then apply.
+- **The image folder must end in `static/cards`** of your Hugo site: the page points at
+  `/cards/<cardId>.png`, and Hugo serves `static/` at the site's root.
+- **The branch must already exist.** The commit is built on its current files, so nothing else in the
+  repository changes. The commit message is `card: <slug> (<cardId>)`.
+- **Names:** `<slug>` is lowercase letters and digits in groups joined by single hyphens, at most 100
+  characters; `<cardId>` is a lowercase UUID, the same one as in the upload's object key.
+- **Delete** (in the review editor) removes both files in one commit, `delete card: <slug> (<cardId>)`.
+- **A new slug** for a card that is already published writes a new page and leaves the old
+  `<old-slug>.md` behind: delete that one by hand. The image is named by cardId, so it is replaced in place.
+
+### The card's front matter
+
+Each page is front matter only, with no body, so your templates render the card from its parameters.
+A page looks like this:
+
+```yaml
+---
+title: "Serverless Sorcerer"
+slug: "serverless-sorcerer-2025"
+weight: 7
+event: "AWS Summit Stockholm"
+year: 2025
+effect: "Draw 1 card.\nUse 1 cloud adoption effect."
+image: "/cards/3f2b8c1e-7d4a-4e5b-9c6f-0a1b2c3d4e5f.png"
+description: "Runs your code without a server in sight."
+category: "collectibles"
+subcategory: ""
+uploader: ["Jane"]
+---
+```
+
+| Parameter     | Type                    | What it holds                                                                     |
+| ------------- | ----------------------- | --------------------------------------------------------------------------------- |
+| `title`       | string                  | The card's name: drafted by the vision model, checked in review.                 |
+| `slug`        | string                  | The page's slug, the same as its file name.                                       |
+| `weight`      | number, or empty        | The sort order you set in review.                                                |
+| `event`       | string                  | The event the card comes from, from the upload form.                             |
+| `year`        | number, or empty        | The card's year, from the upload form.                                           |
+| `effect`      | string                  | The gameplay text, one line per effect, joined by `\n`.                           |
+| `image`       | string                  | Always `/cards/<cardId>.png`.                                                     |
+| `description` | string                  | A short description: drafted by the vision model, checked in review.             |
+| `category`    | string                  | `collectibles` unless you set another in review.                                  |
+| `subcategory` | string                  | Set in review; often empty.                                                       |
+| `uploader`    | list of strings         | The name from the upload form, or `[]` when none was given.                      |
+
+- **Text** is always a double-quoted YAML string, with quotes, backslashes, line breaks and control
+  characters escaped, so card text can't break the block.
+- **An empty number** is written as `weight:` with nothing after it, which YAML reads as null.
+- **Escape on output.** The uploader name comes from the public form, unverified. Let Hugo escape every
+  parameter as it does by default; don't pass any of them through `safeHTML`.
+
+### The upload API the form calls
+
+The form uploads a photo in two requests, both from the browser:
+
+1. **Ask for an upload.** `POST` JSON to `<api>/get-upload-url`, where `<api>` is
+   `terraform output -raw get_upload_url_api_endpoint`:
+
+   ```json
+   {"contentType": "image/jpeg", "eventName": "AWS Summit Stockholm", "year": "2025", "uploader": "Jane"}
+   ```
+
+   | Field         | Required | Accepted                                                                                                        |
+   | ------------- | -------- | --------------------------------------------------------------------------------------------------------------- |
+   | `year`        | yes      | Four digits, from 2020 to the current year (UTC), as a string or a number.                                      |
+   | `contentType` | no       | `image/jpeg`, `image/jpg`, `image/png`, `image/webp`, `image/heic`, `image/heif`, `image/bmp` or `image/tiff`. Empty means `image/jpeg`. |
+   | `eventName`   | no       | At most 100 characters.                                                                                        |
+   | `uploader`    | no       | At most 60 characters.                                                                                         |
+
+   The answer is a `200` with:
+
+   ```json
+   {
+     "uploadUrl": "https://…",
+     "fields": {"key": "…", "Content-Type": "image/jpeg", "x-amz-meta-uploader": "Jane", "policy": "…", "…": "…"},
+     "objectKey": "images/raw/AWS-Summit-Stockholm_2025_3f2b8c1e-7d4a-4e5b-9c6f-0a1b2c3d4e5f.jpg",
+     "maxUploadBytes": 26214400,
+     "metadata": {"eventName": "AWS Summit Stockholm", "year": "2025", "uploader": "Jane"}
+   }
+   ```
+
+   A rejected request gets a `400` with `{"error": "…"}` naming the field. The API takes 5 requests a
+   second (bursts of 10); above that, API Gateway answers `429`.
+
+2. **Upload the photo.** `POST` a `multipart/form-data` form to `uploadUrl`: every entry of `fields`,
+   unchanged, then the file as the field `file`, last. Do it within 5 minutes; S3 answers `204`. S3 refuses
+   an empty file, one over `maxUploadBytes`, or a form whose fields were changed.
+
+```js
+async function uploadCard(api, file, eventName, year, uploader) {
+  const res = await fetch(`${api}/get-upload-url`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ contentType: file.type, eventName, year, uploader }),
+  });
+  const presign = await res.json();
+  if (!res.ok) throw new Error(presign.error ?? `HTTP ${res.status}`);
+  if (file.size > presign.maxUploadBytes) throw new Error("The photo is too large.");
+
+  const form = new FormData();
+  for (const [name, value] of Object.entries(presign.fields)) form.append(name, value);
+  form.append("file", file);
+  const upload = await fetch(presign.uploadUrl, { method: "POST", body: form });
+  if (!upload.ok) throw new Error(`Upload failed: HTTP ${upload.status}`);
+}
+```
+
+- **CORS:** the page's origin must be in `allowed_origins`; it opens both the API and the bucket. List
+  every domain the form is served from, the Amplify default domain too if you use it.
+- **The event on the card** is built from `eventName` in the object key: only ASCII letters, digits and
+  hyphens are kept (anything else becomes a hyphen), at most 60 characters, and the hyphens then turn
+  into spaces. "re:Invent 2024" becomes "re Invent 2024", and an empty name becomes "card".
+  Fix it in review if needed.
+- **An empty `file.type`** (some browsers give none for HEIC) is sent as `image/jpeg`. That still works,
+  because the pipeline reads the bytes, not the type.
+- **The form gets no further answer.** The card appears on the site once you approve it; a rejected
+  photo never does.
+
+---
+
 ## Uploads
 
 - **Formats:** JPG, PNG, HEIC, WebP, BMP, TIFF (HEIC via `pillow-heif` for iPhone
@@ -315,7 +454,7 @@ It works for any flat collectible - trading cards, postcards, stamps, badges - a
 | **What counts as *your* card**  | the three label groups in `lambda/card-detect/build_onnx.py` - describe your cards in `AWS_LABELS`, keep the rest as distractors to score against | yes - re-run `build_onnx.py`, then apply |
 | **How strict the gate is**      | `KEEP_THRESHOLD` / `DROP_THRESHOLD` in `lambda.tf`                                                                                          | no, env vars only                         |
 | **What text is extracted**      | `EXTRACT_SYSTEM` / `EXTRACT_PROMPT` in `lambda/image-processor/app.py`                                                                      | yes, container rebuild                    |
-| **Which fields a card has**     | `write_card_item` in `app.py`, plus the form in `lambda/review-editor/index.py`                                                             | no, zip Lambdas ship on apply             |
+| **Which fields a card has**     | `write_card_item` in `app.py`, the form in `lambda/review-editor/index.py`, and `CARD_FIELDS` and `build_front_matter` in `lambda/committer/index.py` | yes, container rebuild for `app.py`; the zip Lambdas ship on apply |
 | **Background behind the card**  | `BACKGROUND` env var - `black`, `white` or `none` (transparent)                                                                             | no                                        |
 | **How the published page looks**| your own Hugo templates, in your site repo                                                                                                  | no                                        |
 
