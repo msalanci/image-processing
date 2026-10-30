@@ -58,26 +58,24 @@ MIN_YEAR = 2020
 
 def _resp(status, body):
     """
-    Builds an API Gateway HTTP API response with JSON body and CORS headers.
+    Builds an API Gateway HTTP API response with a JSON body.
 
-    Every return path in this Lambda goes through here, so the content type and the CORS header are
-    set in exactly one place. The permissive origin lets the Amplify-hosted Hugo frontend call the
-    endpoint from the browser and also read the JSON error body on a 400 — without it, a validation
-    failure would surface to the user as an opaque network error.
+    Every return path in this Lambda goes through here, so the content type is set in exactly one
+    place. It sets no CORS header: the HTTP API's own CORS configuration answers browsers, for the
+    site's allowed origins only, and API Gateway ignores CORS headers that an integration returns
+    when that configuration exists. The browser can still read the JSON error body of a 400 from an
+    allowed origin, because API Gateway adds the CORS headers to that response too.
 
     Args:
         status: HTTP status code to return.
         body: JSON-serialisable dict for the response body.
 
     Returns:
-        API Gateway response dict with statusCode, headers and a JSON-encoded body.
+        API Gateway response dict with statusCode, a Content-Type header and a JSON-encoded body.
     """
     return {
         "statusCode": status,
-        "headers": {
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*",
-        },
+        "headers": {"Content-Type": "application/json"},
         "body": json.dumps(body),
     }
 

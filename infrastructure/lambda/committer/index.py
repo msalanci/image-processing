@@ -44,6 +44,13 @@ check is repeated here.
 
 CARD_ID_RE is the shape of every cardId that get-upload-url makes: a lowercase UUID. The cardId
 becomes the image's file name in the commit, so it is checked like the slug.
+
+AWS_CONFIG bounds every S3, DynamoDB and Secrets Manager call: 2 seconds to connect, 5 seconds per
+read, at most 2 attempts. A hanging AWS call then ends within about 14 seconds instead of using up the
+function's 30-second timeout, while the review editor waits for the answer.
+
+An error that an action does not handle itself is answered with its type only. The full message goes
+to the log, with the GitHub token removed, because an exception message can quote the token.
 """
 
 import os
@@ -55,6 +62,7 @@ import urllib.request
 import urllib.error
 
 import boto3
+from botocore.config import Config
 
 REGION = os.environ.get("AWS_REGION", "eu-central-1")
 
@@ -67,9 +75,11 @@ GITHUB_IMAGE_DIR = os.environ.get("GITHUB_IMAGE_DIR", "web/awsbuildercards/stati
 IMAGES_BUCKET = os.environ.get("IMAGES_BUCKET", "")
 DDB_TABLE = os.environ.get("DDB_TABLE", "BuilderCards")
 
-secretsmanager = boto3.client("secretsmanager", region_name=REGION)
-s3 = boto3.client("s3", region_name=REGION)
-ddb = boto3.client("dynamodb", region_name=REGION)
+AWS_CONFIG = Config(connect_timeout=2, read_timeout=5, retries={"total_max_attempts": 2, "mode": "standard"})
+
+secretsmanager = boto3.client("secretsmanager", region_name=REGION, config=AWS_CONFIG)
+s3 = boto3.client("s3", region_name=REGION, config=AWS_CONFIG)
+ddb = boto3.client("dynamodb", region_name=REGION, config=AWS_CONFIG)
 
 _github_token = None
 
@@ -165,6 +175,26 @@ def _get_github_token():
     resp = secretsmanager.get_secret_value(SecretId=GITHUB_PAT_SECRET_ARN)
     _github_token = resp["SecretString"].strip()
     return _github_token
+
+
+def _redact(text):
+    """
+    Removes the GitHub token from a text before it is logged.
+
+    http.client refuses a header value that contains a line break and quotes the whole value in its
+    error, so a token stored with a line break inside would appear in the exception message. Each
+    whitespace-separated part of the token is removed, because the message shows the break escaped.
+
+    Args:
+        text: The text to clean, typically an exception message.
+
+    Returns:
+        The text with every part of the cached token replaced by "[redacted]"; the text unchanged when
+        no token has been read yet.
+    """
+    for part in (_github_token or "").split():
+        text = text.replace(part, "[redacted]")
+    return text
 
 
 def _gh(method, path, body=None):
@@ -728,7 +758,9 @@ def handler(event, context):
 
     Returns:
         Whatever the dispatched action returns, or a dict with "error" for a missing cardId, an
-        unknown action or an error the action did not catch.
+        unknown action or an error the action did not catch. For an uncaught error the answer names
+        only the exception type ("publish failed: TimeoutError"); the message is logged, without the
+        token.
     """
 
     action = (event or {}).get("action", "")
@@ -742,6 +774,6 @@ def handler(event, context):
         if action == "delete":
             return do_delete(card_id)
     except Exception as ex:  # noqa: BLE001
-        print(f"[committer] {action} failed for {card_id}: {ex!r}")
-        return {"error": f"{action} failed: {type(ex).__name__}: {ex}"}
+        print(f"[committer] {action} failed for {card_id}: {type(ex).__name__}: {_redact(str(ex))}")
+        return {"error": f"{action} failed: {type(ex).__name__}"}
     return {"error": f"unknown action: {action!r} (expected 'publish' or 'delete')"}

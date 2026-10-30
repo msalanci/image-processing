@@ -1352,6 +1352,31 @@ def _validate(values):
     return ""
 
 
+def _empty_slug_problem(item):
+    """
+    Reports why the stored card's slug may not be emptied, if it may not.
+
+    The stored slug is the only record of where a published card's page is: the committer's delete
+    removes <content dir>/<slug>.md by it. Emptying it on a card that a publish was ever attempted for
+    (any publishStatus) would leave that page on the site after a delete, so such a card keeps its
+    slug, and taking it off the site means deleting the card.
+
+    Args:
+        item: The stored DynamoDB item of the card, or None if it does not exist.
+
+    Returns:
+        An error message when the stored card has both a slug and a publishStatus; an empty string
+        when its slug may be emptied, or when the card does not exist (the save then reports that).
+    """
+    if item and _s(item, "slug") and _s(item, "publishStatus"):
+        return (
+            "this card has been published (or a publish was attempted), and its slug is what lets a "
+            "delete take its page off the site, so the slug cannot be emptied. To take the card off "
+            "the site, delete it."
+        )
+    return ""
+
+
 def handle_save(event):
     """
     Handles the edit form POST: validates, saves, and publishes when approved.
@@ -1362,7 +1387,8 @@ def handle_save(event):
     while the status is approved republishes, so editing a published card (fixing a typo, say)
     overwrites its files on the live branch: the markdown is keyed by the slug and the image by the
     stable cardId, so the same card lands on the same paths. A changed slug leaves the old
-    <slug>.md behind. The same rule covers the first approval and a retry after a failed publish.
+    <slug>.md behind, and a card that a publish was ever attempted for cannot have its slug emptied
+    (_empty_slug_problem()). The same rule covers the first approval and a retry after a failed publish.
     The publish state is set to pending before the committer is invoked, so a crash before the
     result shows as pending instead of silently keeping the old state, and the outcome is recorded
     either way, so a failure is visible and retryable rather than leaving the card silently
@@ -1393,6 +1419,8 @@ def handle_save(event):
     values = {f: form.get(f, [""])[0].strip() for f in EDITABLE}
 
     problem = _validate(values)
+    if not problem and not values.get("slug"):
+        problem = _empty_slug_problem(get_card(card_id))
     if problem:
         return _html_resp(
             f"<p>Invalid input: {esc(problem)}</p>"
