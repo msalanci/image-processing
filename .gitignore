@@ -1,17 +1,57 @@
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 Michal Salanci
 
-# Deployer-specific values and Terraform state; terraform.tfvars.example is the published template
+# opened files
+*~$*
+
+# virtual envs directories and virtual envs
+venv*
+.venv*
+
+# Random files and folders
+.DS_Store
+*.swp
+
+# Dependencies
+node_modules/
+
+# Python files and folders
+__pycache__/
+*.pyc
+.pytest_cache/
+.ipynb_checkpoints/
+.ruff_cache
+.export-venv
+
+# Logs
+**/*.log
+
+# Private keys
+**/*.pem
+
+# Terraform / Terragrunt
+.terraform/
+.terragrunt-cache/
+.terragrunt-tmp/
+*.tfstate
+*.tfstate.backup
+*.terraform.tfstate.lock.info
+*.tfplan
+override.tf
+override_*.tf
+
+# tfvars for public repo
 *.tfvars
 !*.tfvars.example
-*.tfstate
-*.tfstate.*
-*.tfplan
-.terraform/
+
+# AWS Related
+.aws-sam
+
+
 
 # Build outputs: the Lambda zips, and the card-detect model that build_onnx.py generates
-infrastructure/build/
-infrastructure/lambda/card-detect/onnx_out/
+/infrastructure/build/
+/infrastructure/lambda/card-detect/onnx_out/
 
 # Local environments and caches
 .venv/
